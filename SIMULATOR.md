@@ -108,10 +108,15 @@ trace 里记的 `cached_tokens` 拿来对答案，而且很好用：
 run 20260912-072938，95,403 对相邻 turn
   prompt_{k+1} < prompt_k + completion_k        0 例   -> 下一轮 prompt 就是上一轮整段再加新内容
   cached_{k+1} - (prompt_k + completion_k)      p50 -113，p90 -69，全部为负
+  cached_{k+1} == floor(prompt_k / 64) * 64     99.62%（95,359 对里 94,999 对；其余多一整页）
 ```
 
-少掉的那 ~113 个 token，来自 `page_size=64` 的对齐，加上 SGLang 扣下的最后一页。一个不管 paging
-的 simulator 会预测差值是 0，马上露馅。
+少掉的那 ~113 个 token 是上一轮的整段输出，加上 prompt 不满一页的零头。SGLang 0.5.8 请求结束时往
+radix tree 里插的是 `req.fill_ids`，也就是最后一次 prefill 时的 prompt；decode 路径从不更新它，输出
+的 KV 直接释放。所以下一轮只能命中上一轮的 prompt，按页向下取整，上一轮写的东西每轮都要重新
+prefill 一遍。（这里原来写的是「页对齐加上扣下的最后一页」，是猜的，2026-10-07 拿 stub 跑真
+scheduler 时才发现不对。）一个照「输出也进 cache」去抄 SGLang 的 simulator 会预测差值不到一页，
+马上露馅；跑真 scheduler 不用知道这件事，自动就对（§7）。
 
 同样不能喂的还有：prefill / decode 怎么交错、队列深度、KV token usage、retraction 次数、
 ramp / plateau / drain 的形状。
@@ -396,14 +401,16 @@ trace 越差，interval 越宽，但不会突然算不出来。
 **为什么不照源码抄一份。** 抄看起来没有参数要拟合，可抄的过程处处是隐藏参数：page 怎么对齐、
 扣下哪一页、`new_token_ratio` 什么时候衰减、chunked prefill 怎么切、retraction 先踢谁。哪一处抄错
 都不报错，只会让结果差几个百分点，然后被当成 cost model 的误差去调。跑真的，这类错误就不存在了。
-§3 那个 `cached_tokens` 少 113 个 token 的现象，不用建模就自动出来。
+§3 那个 `cached_tokens` 少 113 个 token 的现象就是例子：我们原来以为是页对齐，其实是 SGLang 根本不缓存
+输出。stub 化的真 scheduler 第一次跑就复现了，照源码抄的版本几乎一定会抄错。
 
 **怎么接**（0.5.8 没有 plugin 机制，只能在进程里直接 patch）：
 
 | 改哪里 | 怎么改 | 为什么 |
 | --- | --- | --- |
-| `Scheduler.init_tp_model_worker`（`scheduler.py:494`） | 换成构造 `SimTpModelWorker` | worker 只在这里构造 |
-| KV pool | 在 CPU 上建 `ReqToTokenPool` / `TokenToKVPoolAllocator`，不分配真的 KV tensor，大小取 config 里的 `max_total_num_tokens` | eviction 和 retraction 在真实的容量边界上发生 |
+| `Scheduler.init_tp_model_worker`（`scheduler.py:494`） | 子类覆盖它，构造 `StubWorker`；顺带建一次单 rank 的 gloo process group | worker 只在这里构造 |
+| KV pool | 在 CPU 上建 `ReqToTokenPool` 和分页 allocator，不分配真的 KV tensor，大小取 config 里的 `max_total_num_tokens`。allocator 的 extend 用 SGLang 自带的纯 torch 版本（NPU 后端那份 `_alloc_extend_naive`），页数照样用 `get_num_new_pages` 算 | eviction 和 retraction 在真实的容量边界上发生；CUDA 版是 triton kernel，CPU 上跑不了 |
+| `attention_backend` | 换成 `torch_native` | scheduler 路径上它只决定 `mem_cache/common.py` 里两个 KV 下标的小函数走 triton 还是 torch，不影响任何决定。`ServerArgs` 会按 backend 推默认值，所以 config bundle 要先用真实 backend 把 `page_size`、`chunked_prefill_size` 这些算出来，再换 |
 | `forward_batch_generation` | 不算任何东西，每条请求吐一个 token。没到 `completion_tokens` 时吐一个由 (请求 id, 位置) hash 出来的 token（避开 EOS 和 stop token），到了就吐 EOS。`stop="length"` 的请求不吐 EOS，让 SGLang 自己按 cap 停 | 什么时候停来自 trace；scheduler 看到的仍然只有 cap（§4） |
 | 主循环 | 不调 `event_loop_normal`（`scheduler.py:1068`，死循环 + ZMQ）。engine 自己一步一步调同样那几个函数：`process_input_requests` → `get_next_batch_to_run` → `run_batch` → cost model 给出这一步耗时、虚拟时钟往前走 → `process_batch_result`。overlap 模式下 `process_batch_result` 晚一步调，照 `event_loop_overlap` 的做法 | 时钟归 engine 管，SGLang 只负责做决定 |
 | 输出 | 截住 `send_to_tokenizer`，把「哪条请求在哪一步结束」交回 engine；每一步记下 `forward_mode`、`extend_lens`、`seq_lens`、`cached_tokens` | 预测 timeline 就从这里来 |
@@ -435,13 +442,29 @@ SGLang 看到的只是 token 序列。
 
 - 版本绑定：simulator 里跑的 SGLang 必须和 config 里 server 的版本一致，否则拒绝。每升一次 SGLang，
   stub 都要重新对一遍。
-- 速度：我们的 run 每个 replica 大约 5.5 万步（gen 2418s ÷ 每步 44ms），真 scheduler 每一步都要在
-  上百个请求对象上跑一遍 Python。先量出跑一次完整模拟要多久，再决定 §11 的抽样次数 N=64 撑不撑得住。
-  撑不住就降 N，在报告里写明——**不许为了快换回自己抄的版本**。
+- 速度：见下面「量过的」。**不许为了快换回自己抄的版本**。
 
-**还没验证：一个进程里能不能同时起多个 `Scheduler`。** `Scheduler.__init__` 还会建 ZMQ socket、
-加载 tokenizer，可能还会初始化 torch.distributed。起不了的话，就每个 replica 一个进程，engine 当
-协调者，按虚拟时钟同步推进。慢，但结果一样。
+**量过的（2026-10-07，代码在 `src/simulator/engine/sglang_stub.py`）：**
+
+- **一个进程能起多个 `Scheduler`。** ZMQ socket 只 connect 不 bind，输出截住就不会发；tokenizer 用
+  `skip_tokenizer_init` 跳过；torch.distributed 建一次单 rank 的 gloo group，所有 replica 共用。
+  它们共用的进程级状态只有这些 group 和 `get_global_server_args()`，所以一个进程里的 replica 必须
+  配置一样，配置不同就各开一个进程（构造时会拒）。验法：同一份 workload，一个 replica 单独跑，
+  和另一个 replica 交替跑，每一步的 forward mode、batch 里有哪些请求、extend 长度逐步一样，overlap
+  开和关都一样（`tests/test_simulator_sglang_stub.py`）。
+- **stub 停得对。** 每条请求的 completion 数都等于 trace 给的数，按 cap 停的请求由 SGLang 按 length
+  停；跑完 KV 守恒（free + evictable = 总量）。overlap 下有一个坑：chunked prefill 的最后一块发出去
+  的时候，上一块的结果还没处理，`is_chunked` 还是 1。所以 stub 不看 `is_chunked`，看这一块有没有
+  走到序列末尾。
+- **一次完整模拟要多久：** 按 0912 step 1 的形状造的合成负载（2,048 条链、46,864 个请求、758 万输出
+  token，分到两个 replica），一个进程跑完 385 秒墙钟，119,026 次 forward，平均每次 3.24 ms（两个
+  replica 各约 6 万次，和 §7 原来估的 5.5 万对得上）。EXTEND 比 DECODE 多：每一轮请求到达都单独触发
+  一次 prefill batch，这一类每次约 3.3 ms，是最贵的。所以 **N=64 撑得住**：样本之间互不相关，一个样本
+  一个进程，机器有 192 核，64 个并行大约 6.5 分钟；串行是 6.8 小时。不用降 N，也不用优化 stub。
+  脚本是 `scripts/simulator_dev/stub_scheduler_bench.py`。
+
+所以 engine 走单进程：一个样本的所有 replica 放在一个进程里，由同一个虚拟时钟推进；并行发生在
+样本之间，不在 replica 之间。
 
 ---
 
@@ -621,8 +644,8 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 | IR | `src/simulator/ir.py` | 只有 workload | — |
 | realise | `src/simulator/realise.py` | IR，加一个 seed | `simulator.ir` |
 | observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
-| engine | 待建 | 抽样过的 IR + config | `simulator.ir` |
-| 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
+| engine | `src/simulator/engine/`：现在只有 `sglang_stub.py`（stub 化的真 scheduler，§7）；虚拟时钟、router、资源池待建 | 抽样过的 IR + config | `simulator.ir`、SGLang |
+| 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`，`stub_driver.py` 是 5(a)/(b) 用的合成闭环负载；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
 | 对答案 | 待建，放进 `src/simulator/dev/` | 两边都知道 | 全部 |
 
 规矩：
@@ -736,8 +759,10 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
    interval、去补哪项 instrumentation 最划算。前七步是拿答案换信心，到这一步没答案可换了，靠的
    全是前七步攒下的。
 
-**现在到哪了（2026-10-07）：** 第 1 步做完了，下一步先做 5(a)、5(b)：它们不碰 `eta`，又决定 engine
-是单进程还是多进程，所以提到 grid 前面。下面是第 1 步的经过。
+**现在到哪了（2026-10-07）：** 第 1 步做完了。5(a)、5(b) 提到 grid 前面先做了，因为它们不碰 `eta`，
+又决定 engine 是单进程还是多进程：一个进程能起多个 stub 化的 `Scheduler`，互不干扰；一次完整模拟
+385 秒，N=64 并行约 6.5 分钟（§7「量过的」）。顺带发现 SGLang 不缓存输出（§3）。下一步是 5(c)
+从 IR 造 token id，和第 2 步的测量 grid。下面是第 1 步的经过。
 
 schema 加抽样那一步——`src/simulator/ir.py`、
 `src/simulator/realise.py`、`src/simulator/observed.py`、`tests/test_simulator_ir.py`。IR 现在能
