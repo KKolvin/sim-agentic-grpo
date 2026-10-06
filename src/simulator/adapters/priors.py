@@ -45,8 +45,10 @@ def priors_from_json(doc: Mapping[str, Any], *, default: bool = False) -> Priors
     out = []
     for knob, d in doc["priors"].items():
         scale = Uniform(*d["scale"]) if d.get("scale") else None
+        by_key = {k: Empirical(tuple(v), discrete=True) for k, v in (d.get("by_key") or {}).items()}
         out.append(Prior(knob=knob, dist=Empirical(tuple(d["values"])), source=d["source"],
-                         scale=scale, scale_sources=tuple(d.get("scale_sources", ())), default=default))
+                         scale=scale, scale_sources=tuple(d.get("scale_sources", ())), default=default,
+                         by_key=by_key, key_sources=tuple(d.get("key_sources", ()))))
     return Priors.of(*out)
 
 
@@ -77,7 +79,9 @@ def resolve_priors(stated: Mapping[str, Any] | None, *, where: str,
 
     The number moves our run's distribution so its median lands there; how much
     one occurrence differs from the next stays what we measured, since nobody
-    knows that about a harness they did not trace. A single number is a claim
+    knows that about a harness they did not trace. A knob with a per-problem
+    table moves the table by the same factor, so which instances are slow stays
+    ours and how slow the harness is becomes theirs. A single number is a claim
     that the median is right, so that knob gets no scale. A range is the scale:
     the median is drawn between ``lo`` and ``hi``, once per realisation, which is
     what the sensitivity table sweeps (`SIMULATOR.md` §6). Our run's own scale is
@@ -131,7 +135,8 @@ def describe_priors(priors: Priors) -> str:
         m = at(0.5)
         who = f"our run ({p.source})" if p.default else f"you (shape from {p.source})" \
             if p.source.startswith("run:") else f"you ({p.source})"
-        lines.append(f"{knob:16} {m:9.3g}  {rng:20} {who}")
+        keyed = f"; {len(p.by_key)} problems drawn from their own values" if p.by_key else ""
+        lines.append(f"{knob:16} {m:9.3g}  {rng:20} {who}{keyed}")
     return "\n".join(lines) + "\n"
 
 
@@ -155,9 +160,13 @@ def _stated(knob: str, spec: Any, default: Prior | None, what: str) -> Prior:
         dist: Dist = Empirical(tuple(v * hi / m for v in default.dist.values))
     else:
         dist = Uniform(default.dist.lo * hi / m, default.dist.hi * hi / m)  # type: ignore[attr-defined]
+    # The per-problem table moves by the same factor: which instance is slow is
+    # still our measurement, how slow the harness is overall is now the user's.
+    by_key = {k: Empirical(tuple(v * hi / m for v in d.values), discrete=d.discrete)  # type: ignore[attr-defined]
+              for k, d in default.by_key.items()}
     # The source stays our run: the shape is still borrowed from it, so check
     # still refuses to convert that run with it.
-    return replace(default, dist=dist, scale=scale, scale_sources=(), default=False)
+    return replace(default, dist=dist, scale=scale, scale_sources=(), default=False, by_key=by_key)
 
 
 def priors_template(defaults: Priors | None = None) -> str:
@@ -186,7 +195,8 @@ def priors_template(defaults: Priors | None = None) -> str:
         value = f"{p.dist.quantile(0.5):.3g}"
         share = f"{100 * total[knob] / whole:.1f}% of task time" if knob in total else ""
         drift = f", our runs drifted {p.scale.lo:.2f}-{p.scale.hi:.2f}x" if isinstance(p.scale, Uniform) else ""
-        lines.append(f"  # {f'{knob}: {value}':<26} # {KNOB_HELP.get(knob, '')}. {share}{drift}")
+        keyed = f"; {len(p.by_key)} problems have their own values, moved with yours" if p.by_key else ""
+        lines.append(f"  # {f'{knob}: {value}':<26} # {KNOB_HELP.get(knob, '')}. {share}{drift}{keyed}")
     return "\n".join(lines) + "\n"
 
 

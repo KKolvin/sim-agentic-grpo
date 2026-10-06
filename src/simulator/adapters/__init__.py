@@ -13,18 +13,20 @@ from pathlib import Path
 from typing import Sequence
 
 from simulator.adapters.agentic_messages import AgenticMessagesAdapter
+from simulator.adapters.generic import PROFILES, TraceAdapter
 from simulator.adapters.base import (KNOB_BY_KIND, Adapter, AdapterError, Conversion, Prior,
                                      Priors, check, detect)
 from simulator.adapters.priors import default_priors, load_priors, resolve_priors
 
-__all__ = ["ADAPTERS", "Adapter", "AdapterError", "AgenticMessagesAdapter", "Conversion",
+__all__ = ["ADAPTERS", "Adapter", "AdapterError", "AgenticMessagesAdapter", "Conversion", "PROFILES", "TraceAdapter",
            "KNOB_BY_KIND", "Prior", "Priors", "check", "default_priors", "detect", "load", "load_priors",
            "resolve_priors"]
 
-#: Every adapter :func:`load` tries by default: the formats a trace can arrive in
-#: at use time. Our own timeline is not one of them; development passes
-#: ``simulator.dev.agentic_timeline.AgenticTimelineAdapter(step=...)`` explicitly.
-ADAPTERS: tuple[Adapter, ...] = (AgenticMessagesAdapter(),)
+#: What :func:`load` tries by default: one adapter for any trace, which picks a
+#: harness profile when one matches (`trace.py`). Our own timeline is not read this
+#: way; development passes ``simulator.dev.agentic_timeline.AgenticTimelineAdapter(step=...)``
+#: explicitly, because it reads the answers too.
+ADAPTERS: tuple[Adapter, ...] = (TraceAdapter(),)
 
 
 def load(path: Path, priors: Priors, adapters: Sequence[Adapter] | None = None) -> Conversion:

@@ -77,6 +77,19 @@ class Prior:
     same refusal: a scale stretched to reach the trace being converted has seen
     the answer. Empty when the scale is a claim rather than a measurement.
 
+    :attr:`by_key` is the same knob measured per problem
+    (:attr:`~simulator.ir.Session.problem`): a field on a session whose problem
+    is in the table draws from that problem's own values, every other field from
+    :attr:`dist`. It exists because some work belongs to the problem, not the
+    run. One SWE-bench instance's tests score in 15 s, another's in 770 s, and on
+    run 20261006-030010 a handful of such instances carried 17-24% of each
+    step's eval seconds; drawn from one pooled shape, whether they were in the
+    batch at all was lost, and the step-to-step swing it caused sat outside any
+    scale measured across runs. The knob stays one knob: one row in the
+    sensitivity table, one :attr:`scale` over the table and :attr:`dist` alike.
+    :attr:`key_sources` are the runs the table was measured on, refused by
+    :func:`check` exactly like :attr:`source`.
+
     :attr:`default` is True when nobody stated this prior and the simulator's
     default (:func:`simulator.adapters.priors.default_priors`) stands in. It
     changes nothing about how the prior is used; it is there so the provenance
@@ -89,16 +102,26 @@ class Prior:
     scale: Dist | None = None
     scale_sources: tuple[str, ...] = ()
     default: bool = False
+    by_key: Mapping[str, Dist] = field(default_factory=dict)
+    key_sources: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.knob:
             raise AdapterError("a prior needs a knob name")
         if not self.source:
             raise AdapterError(f"prior {self.knob!r} does not say where it was measured")
+        if self.by_key and not self.key_sources:
+            raise AdapterError(f"prior {self.knob!r} has a per-problem table that does not say "
+                               f"which runs it was measured on")
 
-    def unknown(self) -> Unknown:
-        """What an adapter hangs on the field: this prior, as the IR spells it."""
-        return Unknown(dist=self.dist, knob=self.knob, scale=self.scale)
+    def unknown(self, key: str | None = None) -> Unknown:
+        """What an adapter hangs on the field of a session working on problem ``key``."""
+        dist = self.by_key.get(key, self.dist) if key is not None else self.dist
+        return Unknown(dist=dist, knob=self.knob, scale=self.scale)
+
+    def sources(self) -> tuple[str, ...]:
+        """Every run this prior's numbers were measured on: shape, scale and table."""
+        return (self.source, *self.scale_sources, *self.key_sources)
 
 
 @dataclass(frozen=True)
@@ -123,8 +146,13 @@ class Priors:
             out[p.knob] = p
         return cls(out)
 
-    def require(self, knob: str, *, missing: str) -> Unknown:
+    def require(self, knob: str, *, missing: str, key: str | None = None) -> Unknown:
         """The Unknown for a field the trace lacks, or a refusal that says what to supply.
+
+        ``key`` is the session's :attr:`~simulator.ir.Session.problem`; a prior with
+        that problem in its :attr:`~Prior.by_key` answers with the problem's own
+        values. Pass it whenever the session has one: :func:`check` refuses a
+        field that drew from the pooled shape when the table knew its problem.
 
         ``missing`` is the thing the trace does not have, in words, so the error
         reads "the trace does not record tool durations and no prior named
@@ -138,10 +166,25 @@ class Priors:
                 f"the trace does not record {missing} and no prior named {knob!r} was "
                 f"supplied; known priors: {known}"
             )
-        return p.unknown()
+        return p.unknown(key)
+
+    def keyed(self, knob: str, key: str | None) -> bool:
+        """Whether ``knob``'s prior has its own values for problem ``key``, for an adapter's notes."""
+        p = self.by_knob.get(knob)
+        return p is not None and key is not None and key in p.by_key
 
     def sources(self) -> frozenset[str]:
         return frozenset(p.source for p in self.by_knob.values())
+
+
+def estimated_notes(estimated: Mapping[str, int], keyed: Mapping[str, int]) -> list[str]:
+    """One note per knob an adapter estimated: how many fields, and how many drew their problem's own values."""
+    out = []
+    for knob, n in sorted(estimated.items()):
+        k = keyed.get(knob, 0)
+        out.append(f"{n} durations estimated from prior {knob!r}"
+                   + (f", {k} of them from their problem's own measurements" if k else ""))
+    return out
 
 
 def same_run(a: str, b: str) -> bool:
@@ -206,10 +249,12 @@ def check(conv: Conversion, priors: Priors) -> None:
 
     In order: the IR is valid; the observed half names the same source, so a
     workload cannot be diffed against somebody else's timeline; every observed
-    request and session pairs with a node the IR actually has; no prior's shape or
-    scale was measured on the run being converted; and every Unknown in the workload is
-    exactly one of the supplied priors, so an adapter cannot quietly estimate a
-    field from a distribution it made up or read off the trace itself.
+    request and session pairs with a node the IR actually has; no prior's shape,
+    scale or per-problem table was measured on the run being converted; and every
+    Unknown in the workload is exactly one of the supplied priors, drawn from the
+    session's problem's own values whenever the prior has them, so an adapter
+    cannot quietly estimate a field from a distribution it made up or read off
+    the trace itself, nor ignore a table it was handed.
     """
     w, o = conv.workload, conv.observations
     validate(w)
@@ -219,7 +264,7 @@ def check(conv: Conversion, priors: Priors) -> None:
             f"{o.source!r}; the two halves of one trace must name the same source"
         )
     borrowed_from_self = sorted(k for k, p in priors.by_knob.items()
-                                if any(same_run(s, w.source) for s in (p.source, *p.scale_sources)))
+                                if any(same_run(s, w.source) for s in p.sources()))
     if borrowed_from_self:
         raise AdapterError(
             f"priors {borrowed_from_self} were measured on the run of {w.source!r}, the trace "
@@ -238,7 +283,8 @@ def check(conv: Conversion, priors: Priors) -> None:
             raise AdapterError(
                 f"observed session {s.id!r} has no session in the workload to pair with"
             )
-    for carrier in (*(n for s in w.sessions for n in s.nodes()), *w.prefixes):
+    carriers = [*((n, s.problem) for s in w.sessions for n in s.nodes()), *((p, None) for p in w.prefixes)]
+    for carrier, problem in carriers:
         for name, u in carrier.unknown.items():
             p = priors.by_knob.get(u.knob)
             if p is None:
@@ -247,8 +293,11 @@ def check(conv: Conversion, priors: Priors) -> None:
                     f"knob {u.knob!r}, which no supplied prior provides; an adapter does not "
                     f"bring its own distributions"
                 )
-            if u != p.unknown():
+            if u != p.unknown(problem):
+                whose = (f"problem {problem!r}'s own values" if problem in p.by_key
+                         else "the pooled shape")
                 raise AdapterError(
                     f"{type(carrier).__name__.lower()} {carrier.id!r} estimates {name!r} under "
-                    f"knob {u.knob!r} with a distribution that is not the supplied prior's"
+                    f"knob {u.knob!r} with a distribution that is not the supplied prior's "
+                    f"({whose})"
                 )

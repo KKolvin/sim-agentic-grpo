@@ -23,17 +23,23 @@ max across sessions), and the token totals. They are exactly what the engine
 will be fed, so an interval that misses here misses downstream too.
 
 Priors come from a different run (``--prior-run``), as ``check`` insists. The
-scale on each prior (how far off the whole distribution may be) is the spread of
-per-knob *mean* durations across the runs in ``--scale-runs``, relative to the
-prior run, widened to include 1.0. Means, not medians, because the quantities
-checked are sums.
+runs in ``--scale-runs`` (each ``RUN`` or ``RUN:1,2,3`` for several steps) do two
+jobs (:func:`simulator.dev.priors.priors_from_runs`). They fill a per-problem
+table for the knobs in ``--keyed`` (eval by default: an instance's tests take
+what they take), and they give each knob its scale (how far off the whole
+distribution may be): each workload's measured total over what the prior
+predicts for it, the table leaving that workload's run out, widened to include
+1.0. Totals, not medians, because the quantities checked are sums. Name several
+steps: every run of ours draws the same problems at the same step, so step 1
+of many runs only measures noise on one draw of problems.
 
 R4 cannot tell which training step an episode belonged to (no timestamps), so
 its input is the conversation dump filtered to the sessions R0 holds. The
 unfiltered count is reported next to it: that is what text alone would include.
 
-    python scripts/simulator_dev/degrade_trace.py --run 20261006-030010 --step 1 \
-        --prior-run 20261005-113503 --scale-runs 20261005-143426 20260912-072938
+    python scripts/simulator_dev/degrade_trace.py --run 20261006-030010 --step 3 \
+        --prior-run 20261005-113503 --scale-runs 20261005-143426 20260912-072938:1,2 \
+        20260903-002235:1,2,3 20260906-013757:1,2,3 20260908-031915 20260908-052218:1,2
 """
 
 from __future__ import annotations
@@ -54,7 +60,7 @@ from simulator.adapters import check  # noqa: E402
 from simulator.adapters.agentic_messages import AgenticMessagesAdapter  # noqa: E402
 from simulator.adapters.base import AdapterError, Conversion, Priors  # noqa: E402
 from simulator.dev.agentic_timeline import AgenticTimelineAdapter  # noqa: E402
-from simulator.dev.priors import priors_from_workload, scale_from_runs  # noqa: E402
+from simulator.dev.priors import KEYED_KNOBS, parse_runs, priors_from_runs, samples  # noqa: E402
 from simulator.ir import IRError, Workload, validate  # noqa: E402
 from simulator.realise import knobs, realise  # noqa: E402
 
@@ -152,17 +158,32 @@ def _median(xs) -> float:
     return _q(sorted(xs), 0.5) if xs else float("nan")
 
 
-def build_priors(prior: Conversion, scale_convs: dict[str, Conversion]) -> tuple[Priors, list[dict]]:
-    run_of = {c.workload.source: run for run, c in scale_convs.items()}
-    priors, ratios = scale_from_runs(priors_from_workload(prior.workload),
-                                     {run: priors_from_workload(c.workload) for run, c in scale_convs.items()})
+def build_priors(prior: Conversion, scale_convs: list[Conversion], keyed) -> tuple[Priors, list[dict]]:
+    priors, ratios = priors_from_runs(prior.workload, [c.workload for c in scale_convs], keyed=keyed)
     table = []
     for knob, p in sorted(priors.by_knob.items()):
         table.append({"knob": knob, "n": len(p.dist.values), "mean_s": _mean(p.dist.values),
-                      "median_s": _median(p.dist.values),
-                      "mean_ratio": {run_of[s]: round(v, 3) for s, v in ratios[knob].items()},
+                      "median_s": _median(p.dist.values), "problems": len(p.by_key),
+                      "ratio": {_label(s): round(r["ratio"], 3) for s, r in ratios[knob].items()},
+                      "covered": {_label(s): round(r["covered"], 2) for s, r in ratios[knob].items()},
                       "scale": [p.scale.lo, p.scale.hi] if p.scale else None})
     return priors, table
+
+
+def _label(source: str) -> str:
+    return source.removeprefix("run:")
+
+
+def predicted_ratio(w: Workload, p) -> tuple[float, float]:
+    """``w``'s measured total over what prior ``p`` predicts for its problems, and the share it covered."""
+    xs = samples(w).get(p.knob, [])
+    if not xs:
+        return float("nan"), 0.0
+    means = {k: _mean(d.values) for k, d in p.by_key.items()}
+    m0 = _mean(p.dist.values)
+    pred = sum(means.get(k, m0) if k is not None else m0 for k, _ in xs)
+    return sum(v for _, v in xs) / pred, sum(k in means for k, _ in xs) / len(xs)
+
 
 
 def without_scale(w: Workload) -> Workload:
@@ -322,15 +343,23 @@ def _covers(point: float, lohi: tuple[float, float, float]) -> str:
 def report(args, prior_table, rungs, r4_filter, cmp) -> str:
     L = []
     L.append(f"# 削 trace: run {args.run} step {args.step}\n")
-    L.append(f"prior run {args.prior_run} step {args.prior_step}; scale from "
-             f"{', '.join(args.scale_runs) or 'nothing (no scale)'}; {args.seeds} realisations per rung.\n")
+    L.append(f"prior run {args.prior_run} step {args.prior_step}; scale and per-problem tables from "
+             f"{', '.join(args.scale_runs) or 'nothing (no scale)'}; keyed knobs: "
+             f"{', '.join(args.keyed) or 'none'}; {args.seeds} realisations per rung.\n")
+    L.append("Ratio is a workload's measured total over what the prior predicts for it (its problems' own "
+             "means where the table, without that workload's run, has them; the pooled mean elsewhere). "
+             "Covered is the share of its fields the table had.\n")
     L.append("## Priors\n")
-    L.append("| knob | n | mean | median | mean ratio vs prior (other runs) | scale | this run's mean ratio (the answer) |")
-    L.append("|---|---:|---:|---:|---|---|---:|")
+    L.append("| knob | n | mean | median | problems keyed | ratio (covered) per other workload | scale | "
+             "this trace's ratio (the answer) | covered |")
+    L.append("|---|---:|---:|---:|---:|---|---|---:|---:|")
     for row in prior_table:
         sc = row['scale'] and f"[{row['scale'][0]:.3f}, {row['scale'][1]:.3f}]"
+        per = ", ".join(f"{k} {v}" + (f" ({row['covered'][k]})" if row['problems'] else "")
+                        for k, v in row['ratio'].items())
         L.append(f"| {row['knob']} | {row['n']} | {row['mean_s']:.2f}s | {row['median_s']:.2f}s | "
-                 f"{row['mean_ratio']} | {sc} | {row.get('this_run_mean_ratio')} |")
+                 f"{row['problems'] or '-'} | {per} | {sc} | {row.get('this_run_ratio')} | "
+                 f"{row.get('this_run_covered') if row['problems'] else '-'} |")
     L.append("\n## Rungs\n")
     L.append("| rung | trace still has | result | sessions | requests | tasks | estimated fields | observed req/sess | wall |")
     L.append("|---|---|---|---:|---:|---:|---|---|---:|")
@@ -393,7 +422,11 @@ def main() -> int:
     ap.add_argument("--step", type=int, default=1)
     ap.add_argument("--prior-run", required=True)
     ap.add_argument("--prior-step", type=int, default=1)
-    ap.add_argument("--scale-runs", nargs="*", default=[], help="run ids whose step --prior-step gives the scale")
+    ap.add_argument("--scale-runs", nargs="*", default=[],
+                    help="RUN (step --prior-step) or RUN:1,2,3: the workloads that give the scale and the "
+                         "per-problem tables")
+    ap.add_argument("--keyed", nargs="*", default=list(KEYED_KNOBS),
+                    help="knobs measured per problem; pass the flag with nothing to key none")
     ap.add_argument("--seeds", type=int, default=32)
     ap.add_argument("--group-size", type=int, default=8, help="rollout.n, for the text-only adapter")
     ap.add_argument("--timelines", type=Path, default=Path(f"/data0/shared/{USER}/agentic-timelines"))
@@ -408,13 +441,14 @@ def main() -> int:
 
     log(f"prior run {args.prior_run} step {args.prior_step}")
     prior_conv = load_timeline(args.timelines / args.prior_run, args.prior_step, Priors())
-    scale_convs = {}
-    for run in args.scale_runs:
-        log(f"scale run {run} step {args.prior_step}")
-        scale_convs[run] = load_timeline(args.timelines / run, args.prior_step, Priors())
-    priors, prior_table = build_priors(prior_conv, scale_convs)
+    scale_convs = []
+    for run, step in parse_runs(args.scale_runs, args.prior_step):
+        log(f"scale run {run} step {step}")
+        scale_convs.append(load_timeline(args.timelines / run, step, Priors()))
+    priors, prior_table = build_priors(prior_conv, scale_convs, args.keyed)
     for row in prior_table:
-        log(f"  prior {row['knob']}: n={row['n']} mean={row['mean_s']:.2f}s ratios={row['mean_ratio']} scale={row['scale']}")
+        log(f"  prior {row['knob']}: n={row['n']} mean={row['mean_s']:.2f}s problems={row['problems']} "
+            f"ratios={row['ratio']} scale={row['scale']}")
 
     rungs: list[dict] = []
 
@@ -444,10 +478,9 @@ def main() -> int:
         print("R0 did not convert; nothing to degrade", file=sys.stderr)
         return 2
     keep = {s.id for s in r0.workload.sessions}
-    own = priors_from_workload(r0.workload)
     for row in prior_table:
-        p = own.by_knob.get(row["knob"])
-        row["this_run_mean_ratio"] = round(_mean(p.dist.values) / row["mean_s"], 3) if p and row["mean_s"] else None
+        ratio, covered = predicted_ratio(r0.workload, priors.by_knob[row["knob"]])
+        row["this_run_ratio"], row["this_run_covered"] = round(ratio, 3), round(covered, 2)
 
     run_rung("R1", "task durations stripped",
              lambda: load_timeline(rewrite(tl, args.work / "r1", edit_r1), args.step, priors))

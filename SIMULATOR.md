@@ -139,7 +139,7 @@ IR 借的是编译器的说法：adapter 把各种 harness 的 trace 翻成 IR�
 | class | 是什么 | 关键字段 |
 | --- | --- | --- |
 | `Workload` | 一整份 workload | `sessions`、`prefixes`、`source`（从哪来） |
-| `Session` | 一串相关的活，比如一个 episode | `requests`、`tasks`、`leases`、`group`、`release_offset_s`、`spawned_by` |
+| `Session` | 一串相关的活，比如一个 episode | `requests`、`tasks`、`leases`、`group`、`release_offset_s`、`spawned_by`、`problem` |
 | `Request` | 一次 inference 调用 | `prompt_tokens`、`completion_tokens`、`prefix_parent`、`shared_prefix_tokens`、`max_new_tokens`、`after` |
 | `Task` | 不是 inference 的活：tool、起容器、打分 | `duration_s`、`pool`、`after` |
 | `Lease` | 跨好几个活一直占着的资源，比如一个 episode 从头占到尾的 container | `pool`、`acquire_before`、`release_after` |
@@ -147,6 +147,10 @@ IR 借的是编译器的说法：adapter 把各种 harness 的 trace 翻成 IR�
 | `Unknown` | 这个字段没人量过，要从哪个分布抽 | `dist`、`knob`、`scale` |
 
 `Request`、`Task`、`Prefix` 还各带两张小表：`prov` 和 `unknown`，见下面「IR 怎么说不知道」。
+
+`Session.problem` 是这个 session 在做哪道题，比如 SWE-bench 的 instance id。engine 不读它，只有 prior
+读：有些活多长是题目决定的，跟 run 无关。同一个 instance 的测试跑 15 秒还是 770 秒，换谁写 patch
+都差不多。所以 eval 的 prior 按 instance 查表（§5）。
 
 一个 Session 是一张 DAG：node 是 Request 或 Task，edge 是 `after`（「等它做完我才能开始」）。
 一个 SWE-bench episode 和一条 open-loop serving 负载都要能用这同一套 class 写出来，
@@ -246,9 +250,16 @@ bundle 要能原样存成一个文件、跟着预测结果走，不然这份预�
 一个数都拿不到。
 
 默认值是一份存进 repo 的文件 `src/simulator/adapters/default_priors.json`，由
-`scripts/simulator_dev/build_default_priors.py` 生成：分布取 run 20260912-072938 step 1 的全部实测耗时，scale 取
-20261005-113503、20261005-143426、20261006-030010 三个 run 的 step 1 均值相对它的比值，再把 1.0
-包进去。
+`scripts/simulator_dev/build_default_priors.py` 生成。分布取 run 20260912-072938 step 1 的全部实测耗时。
+另外七个 run 的 14 个 step，加上 0912 自己的 step 2，一共 15 个 step（0903 和 030010 各三个、0906 三个、
+0908 两个 run 共三个、1005 两个 run 各一个、0912 step 2），做两件事：
+
+- **eval 按 instance 建表。** 量过至少 4 次的 instance（482 个）有自己的一组值，抽的时候从这组值里
+  原样抽一个，不插值。插值会让最大值只算半个，8 个值里有一个 916 秒的话，这个 instance 的均值就
+  少四成。没量过的 instance 用整体分布。
+- **scale 跨 step 量，不只跨 run。** 每个 run 同一个 step 抽到的题是一样的，只拿 step 1 比，量到的
+  只是同一批题上的噪声。对每个 step 算「实测总量 / prior 预测的总量」，预测时把这个 step 所在的
+  run 从表里拿掉（不然表里有答案，比值永远是 1），再把 1.0 包进去。没建表的 knob 就是均值之比。
 
 **用户怎么配。** 在 bundle 的 YAML 里写一个 `priors` 段，例子在
 `configs/simulator/example_bundle.yaml`：
@@ -268,11 +279,11 @@ priors:
 
 ```yaml
 priors:
-  # eval_duration: 21.7        # running the tests that score one submitted patch. 66.3% of task time, our runs drifted 0.90-1.02x
-  # tool_duration: 0.22        # one tool call (bash, edit, submit, ...). 29.4% of task time, our runs drifted 0.89-1.00x
-  # container_start: 0.377     # starting the container one episode runs in. 3.7% of task time, our runs drifted 0.84-1.09x
-  # patch_recover: 0.737       # pulling the diff out of an episode that never submitted. 0.6% of task time, our runs drifted 0.92-1.00x
-  # cleanup: 0.000697          # removing the container when an episode ends. 0.0% of task time, our runs drifted 0.81-1.00x
+  # eval_duration: 21.7        # running the tests that score one submitted patch. 66.3% of task time, our runs drifted 0.90-1.10x; 482 problems have their own values, moved with yours
+  # tool_duration: 0.22        # one tool call (bash, edit, submit, ...). 29.4% of task time, our runs drifted 0.71-1.04x
+  # container_start: 0.377     # starting the container one episode runs in. 3.7% of task time, our runs drifted 0.79-1.09x
+  # patch_recover: 0.737       # pulling the diff out of an episode that never submitted. 0.6% of task time, our runs drifted 0.88-1.02x
+  # cleanup: 0.000697          # removing the container when an episode ends. 0.0% of task time, our runs drifted 0.77-1.00x
 ```
 
 按占比排，所以实际上只有头两行值得填：打分和 tool 加起来 96%。哪行都不填也能跑，全用我们的。
@@ -280,7 +291,7 @@ priors:
 只有两种写法：
 
 - `eval_duration: 40`：中位数 40 秒。把我们的分布整体挪过去，让中位数落在 40，一次和一次之间差多少
-  还用我们量的。别人一般说得出「打分大概要多久」，说不出它的尾巴长什么样。给一个数等于声明这个
+  还用我们量的。按 instance 的表也乘同一个倍数：哪道题慢还是我们量的，整体多慢听用户的。别人一般说得出「打分大概要多久」，说不出它的尾巴长什么样。给一个数等于声明这个
   中位数是对的，这一行没有 scale，interval 不会因为它变宽。
 - `tool_duration: [0.5, 2]`：拿不准，中位数在 0.5 到 2 秒之间。这个范围就是 scale，sensitivity table
   扫的就是它。
@@ -288,7 +299,7 @@ priors:
 不管哪种，**我们自己的 scale 都不带过去**：它量的是我们几个 run 之间差多少，跟别人写的数准不准没
 关系。knob 名字写错直接拒绝，不然默认值原样留着，用户还以为自己改了。
 
-默认值不能拿来转它自己量过的 run：上面四个 run 的任何一个 step、包括对话 dump，`check` 都会拒，
+默认值不能拿来转它自己量过的 run：上面八个 run 的任何一个 step、包括对话 dump，`check` 都会拒，
 用户给了中位数也一样，因为分布形状还是那个 run 的。要转这几个 run，就用别的 run 现建 prior（削
 trace 实验就是这么做的）。
 
@@ -606,7 +617,7 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 
 | 层 | 在哪 | 允许知道什么 | 允许 import |
 | --- | --- | --- | --- |
-| adapter | `src/simulator/adapters/`：接口在 `base.py`，`agentic_messages.py` 只读对话文本，`priors.py` 读默认 prior 和 config bundle | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
+| adapter | `src/simulator/adapters/`：接口在 `base.py`；只有一个 adapter（`generic.py`），`shapes.py` 认 trace 的长相，`trace.py` 逐字段判断来路；`agentic_messages.py` 是自家 harness 的 profile；`priors.py` 读默认 prior 和 config bundle | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
 | IR | `src/simulator/ir.py` | 只有 workload | — |
 | realise | `src/simulator/realise.py` | IR，加一个 seed | `simulator.ir` |
 | observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
@@ -666,7 +677,34 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 1. **adapter。** 陌生 trace 进来，逐字段判断来路，输出 IR 和 provenance。用户真正碰到的就是这一层，
    所以排第一。交付：一条只有对话的 trace 能造出合法的 workload，每个编出来的字段都带标记。IR
    这边的准备已经做完了（§4：`prov`、`unknown`、`realise`）。别照着自家 trace 写一个
-   `trace_to_ir.py`，要的是同一个接口下的多个 adapter。
+   `trace_to_ir.py`，也别给每种 trace 各写一个 adapter：使用时进来的 trace 来自没见过的 harness，
+   专门为某种格式写的代码到时候一行都用不上。
+
+   所以只有一个 adapter，分两层。下层认长相：一行是一串 chat message、一组带 `gen_ai.*` 的 OTel
+   span、一串每轮的 token 数，还是一行就是一个请求（serving 日志，CSV 也行；有 conversation id 就按
+   它拼成多轮）。列名不分大小写和空格，`Request tokens`、`ContextToken`、`input_length` 是同一个东西。认的是通用写法（`prompt_tokens` / `input_tokens` / `isl` 这些常见
+   拼法、OpenAI 和 Anthropic 的 usage），不是数据集的名字。读出来是同一种每轮记录，没记的字段就是空。
+   上层对每个 IR 字段走同一条梯子：
+
+   | 字段 | 梯子 |
+   | --- | --- |
+   | `prompt_tokens` | usage 或 count（traced）→ tokenizer 配模板渲染消息（derived）→ 下一轮的 cache read 按这份 trace 自己量出的偏移倒推（derived）→ 拒 |
+   | `completion_tokens` | usage 或 count（traced）→ tokenizer 数输出文本（derived）→ 拒 |
+   | prefix parent | token 级的 loop：上一轮整段 → 有消息：这一轮的消息接在哪一轮后面 → 只有 count：prompt 够长就当它接在上一轮整段后面，并计数 → 有块哈希（Mooncake 的 `hash_ids`）：跟别的请求从头开始有几块一样，就挂在那一段共享的 `Prefix` 上，取共享更多的那个 |
+   | 每轮几次 tool | 回应它的 tool 消息（回应它的是 user 消息就是 0 次）→ 输出里写的 call → 什么都不放，写进 note；profile 可以设 `calls_per_turn` 假设几次 |
+   | tool 耗时 | trace 自己记的（traced）→ 上一个回复到下一个请求的间隔（derived，里面有 harness 时间，只当 upper bound）→ prior |
+
+   块哈希先过一道检查：块大小取让 `ceil(长度 / 块大小) = 哈希个数` 在 99% 以上请求上成立的那个，
+   长度优先用 trace 单独记的「哈希覆盖的长度」，没有就用 prompt。对不上就不用哈希。哈希串不串联都行：
+   比的是从头开始的哈希序列，Mooncake 那种串起来的只是特例。
+
+   时间戳先过一道检查：请求的时长中位数是 0、或者有倒着走的，说明时钟是事后重建的，间隔不用。
+   间隔为负（请求重叠）的那一段也退回 prior。
+
+   一个 harness 的语义不是格式：loop 是拼 token 还是每轮重新渲染、哪些 tool 消息是 observation、
+   哪些是 nudge、episode 外面还包着 container 和打分。这些写成 profile，是一份数据，不是另一个
+   reader。自家对话 dump 就是一份 profile（`agentic_messages.py`），在 run 20261005-113503 的
+   2,483 条 episode 上，和改造前的专用 adapter 逐字段一样，顺序也一样。
 
    接口在 [src/simulator/adapters/base.py](src/simulator/adapters/base.py)。每个 adapter
    两个方法：`claims(path)` 说这份文件我认不认识，`convert(path, priors)` 读它。读完交出三样：IR、
@@ -698,10 +736,13 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
    interval、去补哪项 instrumentation 最划算。前七步是拿答案换信心，到这一步没答案可换了，靠的
    全是前七步攒下的。
 
-**现在到哪了：** 落地的是 schema 加抽样那一步——`src/simulator/ir.py`、
+**现在到哪了（2026-10-07）：** 第 1 步做完了，下一步先做 5(a)、5(b)：它们不碰 `eta`，又决定 engine
+是单进程还是多进程，所以提到 grid 前面。下面是第 1 步的经过。
+
+schema 加抽样那一步——`src/simulator/ir.py`、
 `src/simulator/realise.py`、`src/simulator/observed.py`、`tests/test_simulator_ir.py`。IR 现在能
 说「不知道」，能写并行 tool call，能写 subagent，`max_new_tokens` 可以空着让 config 填（§4）。
-第 1 步做了一半：接口在 `adapters/base.py`，读自家 timeline 的 adapter 在
+第 1 步最早的样子：接口在 `adapters/base.py`，读自家 timeline 的 adapter 在
 `dev/agentic_timeline.py`，一份 workload 对应一个训练 step。在 run 20260912-072938 的 step 1 上
 跑过：2,048 个 session、256 个 group 全部合法，1.8 秒转完；它算出的 structural share 减去 observed
 里的 `cached_tokens`，p50 是 114，第一轮的命中率 p10 0.396、p50 0.984，和 §3、§4 的数字对得上。
@@ -727,11 +768,76 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 - 逐节点独立抽样丢掉了 session 内部的相关性（同一个 instance 的 eval 和 tool 是一起长一起短的），
   所以总量盖住了，per-session 的 p50 还是偏低、max 偏高。
 
-report 在 `analysis/20261006-030010/degrade/step1/report.md`。下一步不是给中间两级补一个 timeline 加
-文本的混合 adapter（只剩对话那级已经证明文本够用），而是 scale 的来路：两个 run 不够，要么多拿几个
-run，要么把它当成 config bundle 里要人填的 claim。两条现在都有了：默认 prior 的 scale 用三个 run
-撑开，030010 也在里面；用户也可以在 bundle 里自己写 scale（§5）。config bundle 只落地了 prior 这
-一项，其余几项和 engine 都还没有。
+030010 跑完三个 step 之后又跑了一遍（2026-10-06），step 1、2、3 各一次，prior 不变，scale 分两组：
+原来那两个 run，和再加上 0903、0906、0908 两个 run 一共六个。report 在
+`analysis/20261006-030010/degrade/step<N>/scale-<2|6>runs/report.md`；最早那份 2,037 条的挪到了
+`step1-partial-2037/`，step 1 现在是完整的 2,048 条。
+
+- 结构那一半三个 step 结论一样：中间两级照样拒，只剩对话那级 DAG 形状 2,048/2,048 全对，completion
+  97.6% 到 97.9% 一字不差、总量差 0.011%，prompt 88% 左右一字不差，第一轮 prompt 和 group prefix 全对。
+  对话 dump 一共 6,464 条（三个 step 各 2,048，加 320 条 validation），文本自己分不出 step。
+- 六个 run 撑出来的 scale 在 step 1 上把每个总量都盖住了，tool 和 container_start 原来没盖住的这回
+  也盖住了：这两个是 run 级别的旋钮（机器、docker 快不快），多几个 run 就够。
+- step 2、3 上 eval 没盖住，六个 run 也不行：interval 整个在点的下方（step 3 差 9% 到 25%）。030010 的
+  eval 均值从 step 1 到 step 3 是 19.1、21.9、23.3 秒，step 3 比任何一个 run 任何一个 step 都高。原因不是
+  run 变慢了，也不是 repo 比例变了（按 repo 加权 prior 只预测出 21.2、21.9）。同一个 instance 去掉超过
+  120 秒的 eval 之后，step 1 到 step 3 的比值是 0.98，同时跑的 eval 多几个也不影响耗时。多出来的
+  全在 tail：每个 step 有 19 到 28 个 eval 跑 300 到 900 秒，只占 1%，却占了 eval 总秒数的 17% 到
+  24%，集中在少数几个 instance 上（psf__requests-2317、sphinx-doc__sphinx-7985/8475、
+  sympy__sympy-15875、matplotlib__matplotlib-24149/24177）。
+- 所以 scale 量错了东西：每个 run 的 step 1 用的是同一组 256 个 instance，跨 run 的比值只量到同一批
+  task 上的噪声。step 2 和 step 1 只有 145 个 instance 重合，换一批 task，eval 总量能差 20% 以上，
+  而这个差是 task 带来的，按均值乘一个系数表示不出来。prior 现在不认 instance，同一个 instance 的
+  8 条 rollout 当成 8 次独立抽样，长 eval 的 instance 在不在这一批就丢了。
+
+按这个结论改了 prior（2026-10-06）。IR 加了 `Session.problem`，两个 adapter 都把 instance id 填进去。
+eval 的 prior 按 instance 查表。梯子用的表来自 prior run 113503 的 step 1，加上 143426、0912、0903、0906、
+0908 两个 run 的 12 个 step；scale 用这 12 个 step 量（§5 的做法，只是 030010 不在里面）。默认 prior 也按同样的方法重建了。再跑一遍梯子，三组 prior 对比，
+report 在 `step<N>/pooled-crossstep/` 和 `step<N>/keyed-crossstep/`：
+
+| R1 的 interval 盖不盖得住 R0 的点 | step 1 | step 2 | step 3 |
+| --- | --- | --- | --- |
+| 六个 run 的 step 1，不分 instance（上面那组） | eval、总量都盖住 | eval 低 3% 到 17%，没盖住 | eval 低 9% 到 25%，没盖住 |
+| 跨 step 量 scale，不分 instance | 盖住 | 低 4% 到 20%，没盖住 | 低 10% 到 27%，没盖住 |
+| 跨 step 量 scale，eval 按 instance 查表 | 盖住 | 盖住（-13% 到 +4%） | 差 1% 没盖住（-13% 到 -1%）；R4 盖住 |
+
+- 光把 scale 跨 step 量没用，scale 只是往下多撑了一点。起作用的是按 instance 查表：step 2 盖住了，
+  step 3 只差 1%。
+- 查表以后，030010 三个 step 的 eval 实测和预测之比是 0.928、1.039、1.077，都在 scale [0.885, 1.103]
+  里面。step 3 落在 scale 的上沿附近，p10 到 p90 只取中间 80%，所以差一点。剩下的误差主要是一个
+  instance：psf__requests-2317 的 eval 要么 340 秒左右、要么 770 秒左右，看 patch 是什么样。别的
+  run 两种都有，030010 几乎每次都是 770 秒，一个 step 就多出 3,000 多秒。这只能靠 scale 兜，prior
+  预测不了。
+- per-session 的 p50 第一次三个 step 都盖住了。原来偏低是因为逐节点独立抽样丢了 session 内部的相关性，
+  现在看来这个相关性大半就是 instance 本身。
+- 只剩对话那级（R4）也用上了表：step 1、2 的 2,048 个 eval 全部查到了自己 instance 的值，step 3 是
+  1,976 个。eval 和总量三个 step 都盖住了。
+
+中间两级的混合 adapter 仍然不做。config bundle 只落地了 prior 这一项，其余几项和 engine 都还没有。
+
+2026-10-07 拿 HuggingFace 上的别人的 trace 试了这个通用 adapter，没有为它们改一行格式代码，都用默认的
+`load` 读进来，`check` 和 `realise` 都过：
+
+| trace | 长相 | 进来的样子 |
+| --- | --- | --- |
+| `netpreme/coding_agent_traces` opus-pro（Claude Code 跑 SWE-bench Pro，731 条） | 每轮只有 `isl / osl / isl_new` | token 数 traced；第一轮全都缺 `isl`，按下一轮的 cache read 倒推（这份 trace 上偏移是 -1，p1 到 p99 在 -6 到 -1 之间）；4% 的轮次 prompt 变短，只共享上一轮的 prompt；两轮之间发生了什么 trace 没说，默认什么都不放，要估 tool 就用 `calls_per_turn=1` 的 profile |
+| 同上 gpt-oss-120b-verified 的一个分片（72 条，vLLM） | count 加文本 | tool 次数从输出文本里的 `[tool_use:` 数出来；第一轮是冷的，cache 偏移很散（p99 619），所以 72 个第一轮里有 32 个落到了 `isl_new` 下限 |
+| `Exgentic/agent-llm-traces-v2` 的 SWE-bench 部分（1,959 条，5 个模型 × 4 个 harness） | OTel span：时间戳、usage、全部消息 | token 数全部 traced；prefix parent 靠比消息找；973 条的时钟是重建的（opus、gemini、gpt-5.2 的请求时长都是 0），间隔不用；能用的间隔 47,872 段，标 derived |
+
+后来又加了几份普通 inference 的 trace，单轮的、多轮聊天的都有。为它们加了一种通用的长相（一行一个请求）和块哈希的规则，没有哪一行是为某个数据集写的：
+
+| trace | 长相 | 进来的样子 |
+| --- | --- | --- |
+| `lzzmm/BurstGPT`（Azure OpenAI 的 serving 日志，CSV，140 万行） | 每行一个请求，只有 token 数 | 140 万个单请求 session，token 数 traced，没有共享结构可读 |
+| `valeriol29/mooncake-traces` 四份（mooncake、conversation、toolagent、synthetic） | 每行一个请求，带 512 token 一块的 `hash_ids` | 块大小 100% 推得出来；结构复用 53% 到 80%，靠哈希挂到共享 `Prefix` 上 |
+| `eth-easl/swissai-serving-trace` `data.jsonl`（52 万行） | 每行一个请求，有开始和结束时间 | 6,248 行 token 数是负的，当坏记录跳过；11.6 万行失败请求没有 token 数，也跳过 |
+| 同上 `qwen3-32b-buckets.jsonl` 的前 80MB（10 万行） | 每行一个请求，带 16 token 一块的 `bucket_ids` | 哈希不串联，而且覆盖的是 `token_count`（比 prompt 少 3 个模板 token）；按从头比的规则读出 73.5% 的结构复用 |
+| `ST-TraceWeaver/LLM-Inference-Traces-NYC`（合成的，取 2 万个对话） | 每行一轮，靠 `ConversationID` 和 `Turn` 拼成多轮 | 34,893 轮，token 数 traced，没有一轮的 prompt 比上一轮整段短 |
+| `allenai/WildChat-1M` 一个分片、`ShareGPT_V3`（各取 3,000 个对话） | 只有对话 | 用 Qwen3 的 tokenizer 和它自带的模板数 token，note 里写明 trace 没说用的哪个模板；prefix parent 全部从消息上找到；user 的思考时间不建模 |
+
+最开始那几份 agent trace 都是评测跑出来的，每道题一条，没有 group，也没有打分和 container 的事件，所以 session 里只有
+请求和 tool。Claude Code 会在主对话旁边插几条独立的请求，现在按开始时间串成一条链，跟主链重叠的
+那几段间隔是负的，退回了 prior。
 
 ---
 

@@ -46,7 +46,9 @@ killed on timeout: the event has no flag, so ``duration_is_cap`` is never set.
 
 **Missing fields.** A duration that is not on the event is derived from
 ``t_end - t`` when both are there, and otherwise drawn from the caller's prior for
-that task kind (:data:`~simulator.adapters.base.KNOB_BY_KIND`). Missing token
+that task kind (:data:`~simulator.adapters.base.KNOB_BY_KIND`), keyed by the
+episode's ``instance_id``, which becomes :attr:`~simulator.ir.Session.problem`.
+Missing token
 counts are refused: ``prompt_tokens`` of turn k+1 is tied to turn k's prompt and
 completion by the pure-append rule, and the IR draws each unknown field
 independently, so there is no honest way to estimate one without the other yet.
@@ -59,7 +61,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from simulator.adapters.base import KNOB_BY_KIND, AdapterError, Conversion, Priors
+from simulator.adapters.base import KNOB_BY_KIND, AdapterError, Conversion, Priors, estimated_notes
 from simulator.ir import Lease, Prefix, Request, Session, Source, Task, Unknown, Workload
 from simulator.observed import Observations, ObservedRequest, ObservedSession
 
@@ -108,7 +110,8 @@ class AgenticTimelineAdapter:
             if prefix is not None:
                 prefixes.append(prefix)
             for sid in members:
-                s, oreq, osess = _session(sid, group, prefix, by_traj[sid], priors, tally)
+                s, oreq, osess = _session(sid, group, episodes[sid].get("instance_id"), prefix,
+                                          by_traj[sid], priors, tally)
                 sessions.append(s)
                 obs_req.extend(oreq)
                 if osess is not None:
@@ -202,8 +205,8 @@ def _prefix(group: str, members: list[str], by_traj: dict[str, list[Event]],
     return Prefix(id=f"{group}/prompt", tokens=min(firsts), prov={"tokens": "derived"})
 
 
-def _session(sid: str, group: str, prefix: Prefix | None, evs: list[Event], priors: Priors,
-             tally: "_Tally") -> tuple[Session, list[ObservedRequest], ObservedSession | None]:
+def _session(sid: str, group: str, problem: str | None, prefix: Prefix | None, evs: list[Event],
+             priors: Priors, tally: "_Tally") -> tuple[Session, list[ObservedRequest], ObservedSession | None]:
     one = {n: [e for e in evs if e["name"] == n] for n in
            ("episode", "container_start", "patch_recover", "cleanup", "score",
             "admission_wait", "eval_wait")}
@@ -219,7 +222,7 @@ def _session(sid: str, group: str, prefix: Prefix | None, evs: list[Event], prio
 
     def task(tid: str, kind: str, ev: Event | None, after: tuple[str, ...],
              pool: str | None = None) -> Task:
-        dur, src, unk = _duration(ev or {}, kind, priors, tally)
+        dur, src, unk = _duration(ev or {}, kind, problem, priors, tally)
         prov: dict[str, Source] = {"duration_s": src}
         unknown = {"duration_s": unk} if unk is not None else {}
         t = Task(id=tid, session=sid, duration_s=dur, pool=pool, kind=kind, after=after,
@@ -271,7 +274,7 @@ def _session(sid: str, group: str, prefix: Prefix | None, evs: list[Event], prio
     task(f"{sid}/eval", "eval", _first(one["score"]), after, pool="eval")
 
     session = Session(id=sid, requests=tuple(requests), tasks=tuple(tasks), group=group,
-                      leases=(Lease(pool="container", acquire_before=start.id,
+                      problem=problem, leases=(Lease(pool="container", acquire_before=start.id,
                                     release_after=release_after),))
     return session, observed, _observed_session(sid, one)
 
@@ -280,7 +283,7 @@ def _first(evs: list[Event]) -> Event | None:
     return min(evs, key=lambda e: e["t"]) if evs else None
 
 
-def _duration(ev: Event, kind: str, priors: Priors,
+def _duration(ev: Event, kind: str, problem: str | None, priors: Priors,
               tally: "_Tally") -> tuple[float, Source, Unknown | None]:
     """A task's duration and where it came from, per field (`SIMULATOR.md` §6)."""
     if ev.get("dur") is not None:
@@ -289,8 +292,9 @@ def _duration(ev: Event, kind: str, priors: Priors,
         tally.derived[kind] += 1
         return float(ev["t_end"] - ev["t"]), "derived", None
     knob = KNOB_BY_KIND[kind]
-    u = priors.require(knob, missing=f"{kind} durations")
+    u = priors.require(knob, missing=f"{kind} durations", key=problem)
     tally.estimated[knob] += 1
+    tally.keyed[knob] += priors.keyed(knob, problem)
     return 0.0, "estimated", u
 
 
@@ -325,6 +329,7 @@ class _Tally:
         self.uneven_groups = 0
         self.derived: Counter[str] = Counter()
         self.estimated: Counter[str] = Counter()
+        self.keyed: Counter[str] = Counter()
         self._extra: list[str] = []
 
     def note(self, s: str) -> None:
@@ -343,6 +348,5 @@ class _Tally:
                        f"prefix is the shortest")
         for kind, n in sorted(self.derived.items()):
             out.append(f"{n} {kind} durations derived from t_end - t (no dur on the event)")
-        for knob, n in sorted(self.estimated.items()):
-            out.append(f"{n} durations estimated from prior {knob!r}")
+        out += estimated_notes(self.estimated, self.keyed)
         return tuple(out + self._extra)

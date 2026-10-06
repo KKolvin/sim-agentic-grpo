@@ -96,6 +96,14 @@ class Empirical:
 
     values: tuple[float, ...]
 
+    #: Draw one of :attr:`values` rather than interpolate between neighbours.
+    #: Interpolation gives the min and the max half the weight of every other
+    #: value, which a few thousand values do not notice and eight do: one 916 s
+    #: eval among an instance's eight rollouts would be drawn at 1/14 instead of
+    #: 1/8, and the mean that instance contributes would fall by 40%. Discrete
+    #: draws keep the mean exact, so a small per-problem table uses them.
+    discrete: bool = False
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", tuple(sorted(self.values)))
 
@@ -103,6 +111,8 @@ class Empirical:
         xs = self.values
         if not xs:
             raise IRError("Empirical with no values")
+        if self.discrete:
+            return xs[min(int(min(max(q, 0.0), 1.0) * len(xs)), len(xs) - 1)]
         pos = min(max(q, 0.0), 1.0) * (len(xs) - 1)
         lo = int(pos)
         hi = min(lo + 1, len(xs) - 1)
@@ -340,6 +350,15 @@ class Session:
     #: folding the child's requests into the parent would give them the parent's
     #: routing key, and a subagent's prompt shares almost nothing with it.
     spawned_by: NodeId | None = None
+
+    #: The problem this session works on, when the harness names one: an
+    #: SWE-bench instance id. The engine never reads it. It is what a keyed prior
+    #: looks up (:attr:`simulator.adapters.base.Prior.by_key`), because some work
+    #: belongs to the problem and not the run: one instance's tests take 15 s to
+    #: score, another's 770 s, whichever policy wrote the patch, and a workload
+    #: that drew that instance's eval from everyone's pooled times would lose
+    #: whether the slow one was in the batch at all.
+    problem: str | None = None
 
     def nodes(self) -> Iterator[Request | Task]:
         yield from self.requests
