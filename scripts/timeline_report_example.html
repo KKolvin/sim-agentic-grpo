@@ -1,3 +1,5 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rollout Timeline</title>
 <style>
   :root {
@@ -8,6 +10,7 @@
     --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
     --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
     --crit: #d03b3b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
@@ -29,7 +32,6 @@
   }
   body { background: var(--plane); color: var(--ink);
          font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 20px 72px; }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
   h2 { font-size: 15px; margin: 0 0 2px; letter-spacing: -0.005em; }
   .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 20px; }
@@ -70,16 +72,134 @@
   th.sort { cursor: pointer; user-select: none; white-space: nowrap; }
   th.sort:hover { color: var(--ink-2); }
   th[aria-sort] { color: var(--ink); }
-  td.dim { color: var(--muted); }
+  td.dim, .dim { color: var(--muted); }
   .tip { position: absolute; pointer-events: none; opacity: 0; transition: opacity .08s;
          background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
          padding: 7px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14);
          z-index: 5; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .tip b { font-weight: 600; }
   svg text { font: 11.5px system-ui, -apple-system, sans-serif; }
+
+  /* ---------- shell: a sticky nav over two views ---------- */
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
+  .nav { position: sticky; top: 0; z-index: 20; background: var(--plane);
+         border-bottom: 1px solid var(--border); }
+  .nav-inner { max-width: 1180px; margin: 0 auto; height: 46px; display: flex; align-items: center;
+               gap: 18px; padding: 0 20px; }
+  .brand { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .nav-tabs { display: flex; gap: 2px; align-self: stretch; }
+  .nav-tabs a { display: flex; align-items: center; padding: 0 10px; color: var(--ink-2);
+                cursor: pointer; position: relative; }
+  .nav-tabs a:hover { color: var(--ink); }
+  .nav-tabs a.active { color: var(--ink); }
+  .nav-tabs a.active::after { content: ""; position: absolute; left: 10px; right: 10px;
+                              bottom: -1px; height: 2px; background: var(--ink); }
+  .nav-right { margin-left: auto; display: flex; align-items: center; }
+  .icon-btn { width: 28px; height: 28px; border-radius: 4px; border: 0; background: none; font: inherit;
+              color: var(--ink-2); cursor: pointer; display: inline-flex; align-items: center;
+              justify-content: center; }
+  .icon-btn:hover { background: var(--surface); color: var(--ink); }
+  #main { padding-top: 26px; padding-bottom: 72px; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .page-head { margin: 0 0 16px; }
+  .page-title { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+  .page-title .muted { font-weight: 400; margin-left: 8px; }
+  .delta { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .delta.flat { color: var(--muted); }
+
+  /* ---------- clickable tables ---------- */
+  table.click tbody tr { cursor: pointer; }
+  table.click tbody tr:hover td { background: var(--plane); }
+  td.mono, th.mono { font-family: var(--mono); }
+
+  /* ---------- metrics browser ---------- */
+  .metrics-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 22px;
+                    align-items: start; }
+  @media (max-width: 860px) { .metrics-layout { grid-template-columns: 1fr; } }
+  .tree { position: sticky; top: 64px; max-height: calc(100vh - 88px); overflow: auto;
+          font-family: var(--mono); font-size: 12px; padding-right: 6px; }
+  .tree-node { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 3px;
+               cursor: pointer; color: var(--ink-2); white-space: nowrap; }
+  .tree-node:hover { background: var(--surface); color: var(--ink); }
+  .tree-node.active { color: var(--ink); background: var(--surface); }
+  .tree-node .tw { width: 12px; color: var(--muted); text-align: center; flex: none; font-size: 10px; }
+  .tree-node .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .tree-node .cnt { color: var(--muted); margin-left: auto; padding-left: 8px; font-size: 11px; }
+  .tree-children { margin-left: 12px; border-left: 1px solid var(--border); padding-left: 4px; }
+  .search { border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+            padding: 6px 10px; width: 320px; max-width: 100%; font-family: var(--mono);
+            font-size: 12.5px; color: var(--ink); outline: none; }
+  .search:focus { border-color: var(--axis); }
+  .crumbs { font-family: var(--mono); font-size: 13px; margin: 0 0 8px; display: flex;
+            flex-wrap: wrap; align-items: baseline; gap: 4px; }
+  .crumbs a { color: var(--ink-2); cursor: pointer; }
+  .crumbs a:hover { color: var(--ink); text-decoration: underline; }
+  .crumbs .sepc { color: var(--muted); }
+  .crumbs .cur { color: var(--ink); font-weight: 600; }
+  .folders { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+  .folder { font-family: var(--mono); font-size: 12px; border: 1px solid var(--border);
+            border-radius: 6px; padding: 3px 9px; color: var(--ink-2); cursor: pointer;
+            background: var(--surface); }
+  .folder:hover { color: var(--ink); border-color: var(--axis); }
+  .folder .cnt { color: var(--muted); margin-left: 5px; }
+  .metrics td:not(:first-child) { white-space: nowrap; }
+  .tag-cell { display: flex; flex-direction: column; gap: 1px; max-width: 460px; }
+  .tag-cell .tag { font-family: var(--mono); overflow-wrap: anywhere; }
+  .tag-cell .tag .dim { color: var(--muted); }
+  .tag-cell .desc { font-size: 11.5px; color: var(--muted); display: -webkit-box;
+                    -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+
+  /* ---------- tag detail ---------- */
+  .modal { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center;
+           justify-content: center; padding: 24px; }
+  .modal.hidden { display: none; }
+  .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.42); }
+  .modal-card { position: relative; background: var(--surface); border: 1px solid var(--border);
+                border-radius: 12px; width: min(720px, 100%); max-height: 84vh; overflow: auto;
+                padding: 16px 18px 18px; box-shadow: 0 18px 60px rgba(0,0,0,.28); }
+  .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+  .modal-title { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .modal-desc { color: var(--ink-2); font-size: 12.5px; margin-top: 4px; max-width: 70ch; }
+  .modal-stats { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 12px 0 4px;
+                 font-family: var(--mono); font-size: 12.5px; }
+  .modal-stats .stat-label { color: var(--muted); margin-right: 5px; }
 </style>
 
-<div class="wrap" id="app"></div>
+<header class="nav">
+  <div class="nav-inner">
+    <span class="brand mono" id="brand"></span>
+    <nav class="nav-tabs" id="tabs">
+      <a data-view="overview">overview</a>
+      <a data-view="metrics">metrics</a>
+    </nav>
+    <div class="nav-right">
+      <button class="icon-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">◐</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap" id="main">
+  <section class="view" id="view-overview"></section>
+  <section class="view" id="view-metrics"></section>
+</main>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <div><div class="modal-title mono" id="modal-title"></div>
+           <div class="modal-desc" id="modal-desc"></div></div>
+      <button class="icon-btn" data-close aria-label="Close">✕</button>
+    </div>
+    <div class="modal-stats" id="modal-stats"></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
 
 <script>
 const DATA = /*__DATA__*/null;
@@ -590,18 +710,83 @@ const PHASES = [
   ["update_actor", "actor update", CAT[4]],
   ["update_weights", "weight sync", CAT[5]],
 ];
-const app = document.getElementById("app");
-let current = DATA.steps.length > 1 ? 1 : 0;
+// DATA is null in the committed template -- it is the hole plot_timeline.py
+// fills -- so everything derived from it tolerates that and the boot below
+// says so, instead of throwing here and leaving a blank page.
+const STEPS = (DATA && DATA.steps) || [];
+const M = (DATA && DATA.metrics) || {steps: [], tags: {}, docs: {}, csv: null};
+const TAG_LIST = Object.keys(M.tags);
+const LAST_STEP = M.steps.length ? M.steps[M.steps.length - 1] : null;
+const VIEW = {
+  overview: document.getElementById("view-overview"),
+  metrics: document.getElementById("view-metrics"),
+};
+// What the hash addresses, so a link to a group or a tag reopens it.
+const S = {view: "overview", path: "", query: "", expanded: new Set(), expandedFor: null,
+           sort: {k: "tag", desc: false}, tag: null};
+let current = STEPS.length > 1 ? 1 : 0;
 
-function runHeader() {
-  const trainSteps = DATA.steps.filter(st => st.phases.step);
+const stepLabel = st => st.phase === "val" ? `validation (step ${st.step})` : `step ${st.step}`;
+function go(hash) { location.hash = hash; }
+
+/* ---------- how a tag's numbers read ---------- */
+// A metric name carries its unit: `*_rate` is a share, `timing_s/*` is seconds,
+// `*_ms` is milliseconds, the rest is a plain number formatted to the precision
+// its magnitude deserves. Counts inside the timing groups are the one place the
+// prefix lies, so they are named.
+const COUNT_IN_TIMING = /^timing_s\/agent_loop\/(num_preempted\/(min|max|mean)|slowest\/(num_preempted|prompt_length|response_length|tool_calls))$/;
+function fmtOf(tag) {
+  const seg = tag.split("/").pop();
+  if (/^(traj|rollout)\/exit\//.test(tag)) return "pct";
+  if (/(_rate|_share)$/.test(seg) || /^(rate|share)$/.test(seg)) return "pct";
+  if (/(clip_ratio|hit_ratio|drain_ratio|waste_ratio|_fraction_high|_fraction_low)$/.test(seg)) return "pct";
+  if (COUNT_IN_TIMING.test(tag)) return "int";
+  if (/tok_s$/.test(seg) || /throughput/.test(seg)) return "num";  // a rate, not a duration
+  if (/_ms$/.test(seg) || /_ms$/.test(tag.split("/")[0])) return "ms";
+  if (/_s$/.test(seg) || /_s$/.test(tag.split("/")[0])) return "sec";
+  return "num";
+}
+function num(v) {
+  const a = Math.abs(v);
+  if (!isFinite(v)) return String(v);
+  if (a >= 1e6) return big(v);
+  if (a >= 1000) return f0(v);
+  if (Number.isInteger(v)) return f0(v);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(3);
+  if (a === 0) return "0";
+  if (a < 1e-4) return v.toExponential(2);
+  return v.toFixed(4);
+}
+function fmtVal(v, kind) {
+  if (v == null) return "—";
+  if (kind === "pct") return (v * 100).toFixed(Math.abs(v) < 0.1 ? 2 : 1) + "%";
+  if (kind === "sec") return perCall(v);
+  if (kind === "ms") return num(v) + " ms";
+  if (kind === "int") return f0(v);
+  return num(v);
+}
+// A delta is read in the metric's own unit, except a share, which moves in
+// points. It carries no colour: for an arbitrary tag, down can be the good
+// direction (tail waste) or the bad one (resolve rate).
+function deltaHTML(cur, prev, kind) {
+  if (cur == null || prev == null || !isFinite(cur - prev)) return "";
+  const d = cur - prev;
+  if (Math.abs(d) < 1e-12) return `<span class="delta flat">±0</span>`;
+  const txt = kind === "pct" ? `${(Math.abs(d) * 100).toFixed(2)} pt` : fmtVal(Math.abs(d), kind);
+  return `<span class="delta">${d > 0 ? "▲" : "▼"}${txt}</span>`;
+}
+
+/* ---------- overview: the run, then one rollout phase at a time ---------- */
+function runHeader(root) {
+  const trainSteps = STEPS.filter(st => st.phases.step);
   const genShare = trainSteps.length
     ? trainSteps.reduce((a, st) => a + st.phases.gen.dur / st.phases.step.dur, 0) / trainSteps.length : 0;
-  app.appendChild(h("h1", {text: `Rollout timeline · ${DATA.experiment}`}));
-  app.appendChild(h("p", {class: "sub", text:
-    `${dur(DATA.t_end - DATA.t_start)} of wall clock · ${DATA.steps.length} rollout phases · ` +
-    `${f0(DATA.steps.reduce((a, st) => a + st.episodes, 0))} episodes · ` +
-    `${big(DATA.steps.reduce((a, st) => a + st.out_tok, 0))} decoded tokens`}));
+  root.appendChild(h("h1", {text: `Rollout timeline · ${DATA.experiment}`}));
+  root.appendChild(h("p", {class: "sub", text:
+    `${dur(DATA.t_end - DATA.t_start)} of wall clock · ${STEPS.length} rollout phases · ` +
+    `${f0(STEPS.reduce((a, st) => a + st.episodes, 0))} episodes · ` +
+    `${big(STEPS.reduce((a, st) => a + st.out_tok, 0))} decoded tokens`}));
 
   if (!trainSteps.length) return;
   const c = card("Where a training step's wall clock goes",
@@ -622,20 +807,259 @@ function runHeader() {
       total: Math.max(...trainSteps.map(x => x.phases.step.dur)),
       legend: st === trainSteps[trainSteps.length - 1]}));
   }
-  app.appendChild(c.card);
+  root.appendChild(c.card);
 }
 
-function stepTabs() {
+function stepTabs(root) {
   const bar = h("div", {class: "tabs", role: "tablist"});
-  DATA.steps.forEach((st, i) => {
-    const label = st.phase === "val" ? `validation (step ${st.step})` : `step ${st.step}`;
-    const b = h("button", {class: "tab", role: "tab", text: label});
+  STEPS.forEach((st, i) => {
+    const b = h("button", {class: "tab", role: "tab", text: stepLabel(st)});
     b.setAttribute("aria-selected", i === current);
-    b.onclick = () => { current = i; render(); };
+    b.onclick = () => { current = i; overviewView(root); };
     bar.appendChild(b);
   });
-  app.appendChild(bar);
+  root.appendChild(bar);
 }
+
+function overviewView(root) {
+  root.innerHTML = "";
+  runHeader(root);
+  stepTabs(root);
+  root.appendChild(stepView(STEPS[current]));
+}
+
+/* ---------- metrics: the tag tree ---------- */
+function buildTree(tags) {
+  const root = {name: "", path: "", children: new Map(), leaves: [], total: 0};
+  for (const tag of tags) {
+    const parts = tag.split("/");
+    let node = root;
+    node.total++;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const path = parts.slice(0, i + 1).join("/");
+      if (!node.children.has(parts[i]))
+        node.children.set(parts[i], {name: parts[i], path, children: new Map(), leaves: [], total: 0});
+      node = node.children.get(parts[i]);
+      node.total++;
+    }
+    node.leaves.push(tag);
+  }
+  return root;
+}
+const TREE = buildTree(TAG_LIST);
+const kids = node => [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+function nodeAt(path) {
+  let node = TREE;
+  for (const part of path ? path.split("/") : []) {
+    node = node.children.get(part);
+    if (!node) return null;
+  }
+  return node;
+}
+
+function tagStats(tag) {
+  const vals = M.tags[tag] || [];
+  const pts = [];
+  vals.forEach((v, i) => { if (v != null) pts.push([M.steps[i], v]); });
+  if (!pts.length) return null;
+  const v = pts.map(p => p[1]);
+  return {pts, n: v.length, first: v[0], last: v[v.length - 1], prev: v.length > 1 ? v[v.length - 2] : null,
+          min: Math.min(...v), max: Math.max(...v), mean: v.reduce((a, b) => a + b, 0) / v.length,
+          lastStep: pts[pts.length - 1][0]};
+}
+
+function metricsView(root) {
+  if (!TAG_LIST.length) {
+    root.innerHTML = "";
+    root.appendChild(h("p", {class: "note", text:
+      "No per-step scalars: this report was built without a metrics.csv next to it and the timeline " +
+      "carries no training steps. Run scripts/build_metrics_csv.py --log <run>/run.log first."}));
+    return;
+  }
+  root.innerHTML = "";
+  const head = h("div", {class: "page-head"});
+  head.appendChild(h("h1", {class: "page-title", html:
+    `metrics <span class="muted">${TAG_LIST.length} tags · ${M.steps.length} steps</span>`}));
+  head.appendChild(h("p", {class: "sub", style: "margin:4px 0 0", html:
+    `Every per-step scalar the run produced, as numbers — ${M.csv ? `<b>${M.csv}</b>, i.e. what the ` +
+    `trainer printed to its log and sent to W&B, ` : ""}plus the <b>rollout/*</b> reductions only the ` +
+    `timeline can make. Click a tag for its value at every step; the charts are in the overview.`}));
+  root.appendChild(head);
+
+  const search = h("input", {class: "search", type: "search", placeholder: "filter tags (substring or /regex/)"});
+  search.value = S.query;
+  search.oninput = () => { S.query = search.value.trim(); renderTags(); renderTree(); };
+  root.appendChild(h("div", {style: "margin:0 0 14px"}, search));
+
+  const treeHost = h("nav", {class: "tree"});
+  const mainHost = h("div");
+  root.appendChild(h("div", {class: "metrics-layout"}, [treeHost, mainHost]));
+
+  function renderTree() {
+    treeHost.innerHTML = "";
+    if (S.expandedFor !== S.path) {
+      const parts = S.path ? S.path.split("/") : [];
+      for (let i = 1; i <= parts.length; i++) S.expanded.add(parts.slice(0, i).join("/"));
+      S.expandedFor = S.path;
+    }
+    const build = node => {
+      const frag = document.createDocumentFragment();
+      for (const c of kids(node)) {
+        const open = S.expanded.has(c.path);
+        const row = h("div", {class: "tree-node" + (S.path === c.path ? " active" : ""), html:
+          `<span class="tw">${c.children.size ? (open ? "▾" : "▸") : ""}</span>` +
+          `<span class="nm">${c.name}</span><span class="cnt">${c.total}</span>`});
+        row.querySelector(".tw").onclick = e => {
+          e.stopPropagation();
+          S.expanded.has(c.path) ? S.expanded.delete(c.path) : S.expanded.add(c.path);
+          renderTree();
+        };
+        row.onclick = () => go(`#metrics/${c.path}`);
+        frag.appendChild(row);
+        if (c.children.size && open) frag.appendChild(h("div", {class: "tree-children"}, build(c)));
+      }
+      return frag;
+    };
+    treeHost.appendChild(build(TREE));
+  }
+
+  const COLS = [
+    {k: "tag", label: "tag"},
+    {k: "last", label: "last"},
+    {k: "delta", label: "Δ prev"},
+    {k: "min", label: "min"},
+    {k: "max", label: "max"},
+    {k: "mean", label: "mean"},
+    {k: "n", label: "steps"},
+  ];
+  function renderTags() {
+    mainHost.innerHTML = "";
+    let leaves, folders = [];
+    if (S.query) {
+      const m = S.query.match(/^\/(.+)\/([a-z]*)$/);
+      let re = null;
+      try { re = m ? new RegExp(m[1], m[2]) : null; } catch (e) { re = null; }
+      const q = S.query.toLowerCase();
+      leaves = TAG_LIST.filter(t => re ? re.test(t) : t.toLowerCase().includes(q));
+      mainHost.appendChild(h("div", {class: "crumbs", html:
+        `<span class="cur">${leaves.length} tags match</span> <span class="muted">${S.query}</span>`}));
+    } else {
+      const node = nodeAt(S.path);
+      if (!node) { mainHost.appendChild(h("p", {class: "note", text: `no such path: ${S.path}`})); return; }
+      leaves = node.leaves.slice().sort();
+      folders = kids(node);
+      const parts = S.path ? S.path.split("/") : [];
+      const cr = h("div", {class: "crumbs", html:
+        `<a data-p="">all</a>` + parts.map((p, i) => `<span class="sepc">/</span>` + (i === parts.length - 1
+          ? `<span class="cur">${p}</span>`
+          : `<a data-p="${parts.slice(0, i + 1).join("/")}">${p}</a>`)).join("") +
+        `<span class="muted">&nbsp; ${node.total} tags</span>`});
+      cr.querySelectorAll("a").forEach(a => { a.onclick = () => go(`#metrics/${a.dataset.p}`); });
+      mainHost.appendChild(cr);
+      if (folders.length) {
+        const fl = h("div", {class: "folders"});
+        for (const f of folders) {
+          const b = h("button", {class: "folder", html: `${f.name}/<span class="cnt">${f.total}</span>`});
+          b.onclick = () => go(`#metrics/${f.path}`);
+          fl.appendChild(b);
+        }
+        mainHost.appendChild(fl);
+      }
+    }
+    if (!leaves.length) {
+      mainHost.appendChild(h("p", {class: "note", text: folders.length
+        ? `${folders.length} groups, ${nodeAt(S.path).total} tags below this one — open one, or search across all ${TAG_LIST.length}.`
+        : "nothing here"}));
+      return;
+    }
+
+    const rows = leaves.map(tag => {
+      const s = tagStats(tag), kind = fmtOf(tag);
+      return {tag, kind, s, delta: s && s.prev != null ? s.last - s.prev : null};
+    });
+    const key = S.sort.k;
+    rows.sort((a, b) => {
+      if (key === "tag") return a.tag.localeCompare(b.tag) * (S.sort.desc ? -1 : 1);
+      const av = key === "delta" ? a.delta : a.s && a.s[key], bv = key === "delta" ? b.delta : b.s && b.s[key];
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return (av - bv) * (S.sort.desc ? -1 : 1);
+    });
+    const thead = h("tr", {}, COLS.map(c => {
+      const th = h("th", {class: "sort", text: c.label});
+      if (c.k === key) th.setAttribute("aria-sort", S.sort.desc ? "descending" : "ascending");
+      th.onclick = () => {
+        if (key === c.k) S.sort.desc = !S.sort.desc;
+        else S.sort = {k: c.k, desc: c.k !== "tag"};
+        renderTags();
+      };
+      return th;
+    }));
+    const table = h("table", {class: "click metrics"}, [h("thead", {}, thead)]);
+    table.appendChild(h("tbody", {}, rows.map(r => {
+      const s = r.s, f = v => fmtVal(v, r.kind);
+      const shown = S.query || !S.path ? r.tag : r.tag.slice(S.path.length + 1);
+      const doc = M.docs[r.tag] || "";
+      const tr = h("tr", {}, [
+        h("td", {html: `<div class="tag-cell"><span class="tag">${shown}</span>` +
+          (doc ? `<span class="desc">${doc.replace(/</g, "&lt;")}</span>` : "") + `</div>`}),
+        h("td", {html: s ? f(s.last) + (s.lastStep === LAST_STEP ? "" :
+          `<span class="dim" title="last logged at step ${s.lastStep}"> @${s.lastStep}</span>`) : "—"}),
+        h("td", {html: s ? (deltaHTML(s.last, s.prev, r.kind) || "—") : "—"}),
+        h("td", {text: s ? f(s.min) : "—"}),
+        h("td", {text: s ? f(s.max) : "—"}),
+        h("td", {text: s ? f(s.mean) : "—"}),
+        h("td", {class: "dim", text: s ? f0(s.n) : "0"}),
+      ]);
+      tr.onclick = () => openTag(r.tag);
+      return tr;
+    })));
+    mainHost.appendChild(h("div", {class: "scroll"}, table));
+  }
+
+  renderTree();
+  renderTags();
+}
+
+/* ---------- one tag, every step ---------- */
+function openTag(tag) {
+  const s = tagStats(tag), kind = fmtOf(tag), f = v => fmtVal(v, kind);
+  document.getElementById("modal-title").textContent = tag;
+  document.getElementById("modal-desc").textContent = M.docs[tag] || "";
+  const stat = (k, v) => `<span><span class="stat-label">${k}</span>${v}</span>`;
+  document.getElementById("modal-stats").innerHTML = s
+    ? stat("last", f(s.last)) + stat("Δ", deltaHTML(s.last, s.prev, kind) || "—") + stat("min", f(s.min)) +
+      stat("max", f(s.max)) + stat("mean", f(s.mean)) + stat("steps", f0(s.n))
+    : "no value at any step";
+  const body = document.getElementById("modal-body");
+  body.innerHTML = "";
+  if (s) {
+    const t = h("table", {}, [h("thead", {}, h("tr", {}, ["step", "value", "Δ", "raw"].map(x => h("th", {text: x}))))]);
+    t.appendChild(h("tbody", {}, s.pts.map(([step, v], i) => h("tr", {}, [
+      h("td", {class: "mono", text: `step ${step}`}),
+      h("td", {class: "mono", text: f(v)}),
+      h("td", {html: i ? (deltaHTML(v, s.pts[i - 1][1], kind) || "—") : "—"}),
+      h("td", {class: "mono dim", text: String(v)}),
+    ]))));
+    body.appendChild(h("div", {class: "scroll", style: "margin-top:12px"}, t));
+  }
+  if (!S.tag) S.returnHash = location.hash || "#metrics";
+  S.tag = tag;
+  document.getElementById("modal").classList.remove("hidden");
+  history.replaceState(null, "", `#metric/${encodeURIComponent(tag)}`);
+}
+// ``restore`` is false when the hash already moved on (the router closing a
+// modal the user navigated away from), true when the close is the navigation.
+function closeModal(restore) {
+  const modal = document.getElementById("modal");
+  if (modal.classList.contains("hidden")) return;
+  modal.classList.add("hidden");
+  S.tag = null;
+  if (restore !== false) history.replaceState(null, "", S.returnHash || "#metrics");
+  S.returnHash = null;
+}
+document.getElementById("modal").onclick = e => { if (e.target.closest("[data-close]")) closeModal(); };
+addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
 
 function stepView(st) {
   const wrap = h("div");
@@ -835,13 +1259,72 @@ function stepView(st) {
   return wrap;
 }
 
+/* ---------- routing ---------- */
 function render() {
-  app.innerHTML = "";
-  runHeader();
-  stepTabs();
-  app.appendChild(stepView(DATA.steps[current]));
+  for (const [name, host] of Object.entries(VIEW)) host.classList.toggle("active", name === S.view);
+  for (const a of document.querySelectorAll(".nav-tabs a"))
+    a.classList.toggle("active", a.dataset.view === S.view);
+  if (S.view === "metrics") metricsView(VIEW.metrics);
+  else overviewView(VIEW.overview);
 }
-render();
-let rt;
-addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(render, 150); });
+
+function route() {
+  const raw = location.hash.replace(/^#/, "");
+  const cut = raw.indexOf("/");
+  const head = cut < 0 ? raw : raw.slice(0, cut);
+  const tail = cut < 0 ? "" : raw.slice(cut + 1);
+  if (head === "metric" && tail) {   // a link to one tag: open the group, then it
+    const tag = decodeURIComponent(tail);
+    S.view = "metrics";
+    S.path = tag.includes("/") ? tag.slice(0, tag.lastIndexOf("/")) : "";
+    render();
+    openTag(tag);
+    return;
+  }
+  closeModal(false);
+  if (head === "metrics") {
+    S.view = "metrics";
+    S.path = tail && nodeAt(tail) ? tail : "";
+  } else {
+    S.view = "overview";
+  }
+  render();
+}
+
+for (const a of document.querySelectorAll(".nav-tabs a"))
+  a.onclick = () => go(a.dataset.view === "metrics" ? `#metrics/${S.path}` : "#overview");
+
+/* ---------- theme: the trace is painted on a canvas, so a switch repaints ---------- */
+(function () {
+  const btn = document.getElementById("theme-toggle");
+  try {
+    const stored = localStorage.getItem("timeline-theme");
+    if (stored) document.documentElement.setAttribute("data-theme", stored);
+  } catch (e) { /* private window: keep the OS theme */ }
+  btn.onclick = () => {
+    const cur = document.documentElement.getAttribute("data-theme") ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("timeline-theme", next); } catch (e) { /* ignore */ }
+    if (DATA) render();
+  };
+})();
+
+/* ---------- boot ---------- */
+if (!DATA) {
+  document.getElementById("brand").textContent = "timeline report";
+  document.getElementById("main").innerHTML =
+    `<p class="note">This file is the report <b>template</b>, not a report: the run's data is ` +
+    `substituted into it by <b>scripts/plot_timeline.py</b>. Render one with ` +
+    `<span class="mono">python scripts/plot_timeline.py --dir analysis/&lt;run&gt;/timeline</span>, ` +
+    `which writes <b>timeline.html</b> next to that run's log.</p>`;
+} else {
+  document.title = `timeline · ${DATA.experiment}`;
+  document.getElementById("brand").textContent = DATA.experiment;
+  addEventListener("hashchange", route);
+  route();
+  let rt;
+  addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(render, 150); });
+}
 </script>
