@@ -106,7 +106,7 @@ def run(chains: list[Chain], replica_of: dict[str, StubScheduler], *, step_s: fl
             cid, k = f.rid.rsplit("/", 1)
             if f.reason == "abort":
                 continue
-            prompt[cid] = prompt[cid] + rep.output_ids(f.rid, f.completion_tokens)
+            prompt[cid] = prompt[cid] + list(f.output_ids)
             k_of[cid] = int(k) + 1
             c = chain_of[cid]
             if k_of[cid] < len(c.out):

@@ -216,6 +216,7 @@ class Finished:
     completion_tokens: int
     cached_tokens: int
     reason: str                    # "stop", "length", "abort"
+    output_ids: tuple[int, ...]    # what SGLang sent back, EOS included; the next turn extends it
 
 
 class StubScheduler:
@@ -246,14 +247,11 @@ class StubScheduler:
         self.overlap = self.s.enable_overlap
         self._results = deque()
         self._vocab = self.s.model_config.vocab_size
+        self._out: dict[str, list[int]] = {}   # rid -> output ids sent so far (non-stream sends in pieces)
 
     @property
     def eos(self) -> int:
         return self.w.eos
-
-    def output_ids(self, rid: str, completion_tokens: int) -> list[int]:
-        """The ids the stub produced for a request that finished by EOS."""
-        return [token_id(rid, p) for p in range(completion_tokens - 1)] + [self.eos]
 
     def submit(self, rid: str, input_ids: list[int], completion_tokens: int,
                max_new_tokens: int) -> None:
@@ -318,9 +316,10 @@ class StubScheduler:
         for o in self.s.send_to_detokenizer.outputs:
             if not isinstance(o, BatchTokenIDOutput):
                 continue
-            for rid, fr, ct, cached in zip(o.rids, o.finished_reasons, o.completion_tokens,
-                                           o.cached_tokens):
+            for rid, fr, ct, cached, ids in zip(o.rids, o.finished_reasons, o.completion_tokens,
+                                                o.cached_tokens, o.output_ids):
+                self._out.setdefault(rid, []).extend(ids)
                 if fr is not None:
-                    done.append(Finished(rid, ct, cached, fr["type"]))
+                    done.append(Finished(rid, ct, cached, fr["type"], tuple(self._out.pop(rid))))
         self.s.send_to_detokenizer.outputs.clear()
         return done
