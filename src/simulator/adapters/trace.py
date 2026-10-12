@@ -572,7 +572,8 @@ def _session(s: TraceSession, counts: list[tuple[int, Source, int, Source]], gro
     after: tuple[str, ...] = ()
     start = None
     if env is not None:
-        start = estimated(f"{sid}/start", "container_start", (), pool=env.container_pool)
+        # Runs inside the container the lease below holds; a pool here would take a second slot.
+        start = estimated(f"{sid}/start", "container_start", ())
         after = (start.id,)
     clock = _real_clock(s)
     if not clock and any(t.t_sent is not None and t.t_done is not None for t in s.turns):

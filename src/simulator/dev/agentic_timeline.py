@@ -230,8 +230,8 @@ def _session(sid: str, group: str, problem: str | None, prefix: Prefix | None, e
         tasks.append(t)
         return t
 
-    start = task(f"{sid}/start", "container_start", _first(one["container_start"]), (),
-                 pool="container")
+    # Runs inside the container the session's lease holds, so no pool of its own.
+    start = task(f"{sid}/start", "container_start", _first(one["container_start"]), ())
     after: tuple[str, ...] = (start.id,)
     prev: Request | None = None
     for g in gens:

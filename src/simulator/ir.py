@@ -450,6 +450,14 @@ def validate(w: Workload) -> None:
         for ls in s.leases:
             if ls.acquire_before not in own or ls.release_after not in own:
                 raise IRError(f"lease on {ls.pool!r} in session {s.id!r} references a foreign node")
+            for end in (ls.acquire_before, ls.release_after):
+                n = by_id[end]
+                if isinstance(n, Task) and n.pool == ls.pool:
+                    # The task runs in the slot the lease holds. Asking the pool again takes a
+                    # second slot, and once every slot is held by a lease waiting for its
+                    # second, nothing runs.
+                    raise IRError(f"task {end!r} is an end of session {s.id!r}'s lease on "
+                                  f"{ls.pool!r} and also asks {ls.pool!r} for a slot")
         if s.release_offset_s < 0:
             raise IRError(f"session {s.id!r} has negative release_offset_s")
         if s.spawned_by is not None and s.release_offset_s:
