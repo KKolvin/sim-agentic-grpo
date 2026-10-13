@@ -374,6 +374,10 @@ class Workload:
     accidentally saw a run trace is only detectable if the trace says so.
     """
 
+    #: In the order the harness was handed them: a sync batch's order. A recipe whose
+    #: harness splits the batch across worker processes reads it (``SIMULATOR.md`` §5),
+    #: so which sessions share a worker's pools comes from here. Subagent sessions are
+    #: not in the batch; they go with the session that spawned them.
     sessions: tuple[Session, ...]
 
     #: Provenance: a run id for a replay, a generator name and its parameters for

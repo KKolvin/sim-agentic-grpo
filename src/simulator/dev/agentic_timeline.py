@@ -21,8 +21,9 @@ in :mod:`simulator.dev` and is not in the default
 ``score``               -> Task ``eval`` on the ``eval`` pool.
 ``admission_wait``      -> observed wait on ``container``.
 ``eval_wait``           -> observed wait on ``eval``.
-``episode``             -> observed session span. Also how a session is placed
-                        in a training step (below).
+``episode``             -> observed session span, and the worker process
+                        (``pid``) that ran it. Also how a session is placed in a
+                        training step and in the batch order (below).
 ``format_error``        No work: the next ``generate`` simply follows the last.
 trainer ``cat=train``   -> observed training phases, and the step windows.
 ======================  ====================================================
@@ -32,6 +33,19 @@ wall clock (§0), and the sessions of one step are released together, which is
 what ``release_offset_s = 0`` means. Episodes are placed in a step by the
 trainer's ``gen`` span that contains them, as ``scripts/build_timeline.py`` does;
 validation windows and other steps are skipped and counted in the notes.
+
+**Sessions come out in batch order.** The engine splits the order into contiguous
+chunks, one per worker, as verl's ``DataProto.chunk`` does (§5). Each worker shard
+holds one chunk, 256 sessions of 32 whole groups per step in run 20260912-072938, so
+sessions go shard by shard. Inside a shard, by when each started waiting for its
+container (``admission_wait``'s ``t``, which is not the wait: the wait is ``dur``).
+That is the order the worker's container semaphore served them in, first come first
+served: the first 33 in that order got a slot at once in every shard of step 1, and
+no later one did. It is not quite the batch order. verl awaits the chat template
+before that point, so neighbours sometimes swap, and a group can be split by
+another for a session or two. A session without ``admission_wait`` falls back to
+the episode's ``t``, when it got its container, which under that semaphore is the
+same order.
 
 **A group shares one prefix.** The eight rollouts of one problem send the same
 first prompt (0 groups out of 256 disagreed in step 0 of run 20260912-072938),
@@ -116,6 +130,11 @@ class AgenticTimelineAdapter:
                 obs_req.extend(oreq)
                 if osess is not None:
                     obs_sess.append(osess)
+
+        queued = {e["traj"]: e["t"] for e in traj if e["name"] == "admission_wait"}
+        order = {sid: (int(episodes[sid].get("pid", 0)), queued.get(sid, episodes[sid]["t"]), sid)
+                 for sid in chosen}
+        sessions.sort(key=lambda s: order[s.id])
 
         phases = tuple((e["name"], e["t"], e["t_end"]) for e in train
                        if e.get("step") == step and e.get("t_end") is not None)
@@ -318,7 +337,9 @@ def _observed_session(sid: str, one: dict[str, list[Event]]) -> ObservedSession 
         w = _first(one[name])
         if w is not None and w.get("dur") is not None:
             waits[pool] = float(w["dur"])
-    return ObservedSession(id=sid, t_start=float(ep["t"]), t_end=float(ep["t_end"]), waits_s=waits)
+    pid = ep.get("pid")
+    return ObservedSession(id=sid, t_start=float(ep["t"]), t_end=float(ep["t_end"]), waits_s=waits,
+                           worker=None if pid is None else str(pid))
 
 
 class _Tally:

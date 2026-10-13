@@ -1,7 +1,9 @@
 """The engine's clock: a realised workload through stubbed SGLang replicas (SIMULATOR.md §2, §7).
 
 Generic over the IR: requests, tasks, ``after``, ``offset_s``, leases and task pools. It
-knows nothing of what a session is for. What it adds over :mod:`simulator.dev.ir_driver`
+knows nothing of what a session is for. Pools belong to worker processes: each worker
+has its own slots in every pool, and a session takes slots only from its own worker's
+(:func:`split`). What it adds over :mod:`simulator.dev.ir_driver`
 is the clock: every forward is priced by ``price`` (the cost model, or a constant), and
 each replica's time follows SGLang's own event loop instead of a fixed step.
 
@@ -48,6 +50,18 @@ def constant(step_s: float) -> Price:
     return lambda st: step_s
 
 
+def split(w: Workload, workers: int) -> dict[str, int]:
+    """Which worker runs each session: the session order in contiguous chunks, as verl's
+    ``AgentLoopManager.generate_sequences`` hands ``DataProto.chunk(num_workers)`` out.
+    Chunks are ``ceil(n / workers)`` long like ``torch.chunk``, so a batch that does not
+    divide leaves the last workers short (verl itself refuses one unless padding is on).
+    In a GRPO batch the n rollouts of a problem are adjacent, so a group stays on one
+    worker whenever the chunk length is a multiple of n."""
+    top = [s.id for s in w.sessions if not s.spawned_by]
+    size = -(-len(top) // workers) if top else 1
+    return {sid: k // size for k, sid in enumerate(top)}
+
+
 @dataclass
 class RequestResult:
     replica: int
@@ -80,6 +94,7 @@ class Result:
     requests: dict[str, RequestResult] = field(default_factory=dict)
     tasks: dict[str, TaskResult] = field(default_factory=dict)
     forwards: list[list[Forward]] = field(default_factory=list)   # per replica, in order
+    workers: dict[str, int] = field(default_factory=dict)        # session -> worker
     end: float = 0.0
     wall_s: float = 0.0
     short: dict[str, int] = field(default_factory=dict)
@@ -94,15 +109,17 @@ _MAX_IDLE_SPINS = 3
 
 
 def run(w: Workload, replicas: list[StubScheduler], pools: dict[str, int],
-        price: Price) -> Result:
+        price: Price, workers: int = 1) -> Result:
+    """``pools`` gives each pool's slots per worker; there are ``workers`` of each."""
     require_runnable(w)
     if any(s.spawned_by for s in w.sessions):
         raise NotImplementedError("subagent sessions are not wired into the engine yet")
     tok = TokenIds(w)
     router = Router(len(replicas))
-    res = Result(forwards=[[] for _ in replicas])
+    res = Result(forwards=[[] for _ in replicas], workers=split(w, workers))
 
     node = {n.id: n for s in w.sessions for n in s.nodes()}
+    worker_of = {n.id: res.workers[s.id] for s in w.sessions for n in s.nodes()}
     waiting_on = {nid: len(n.after) for nid, n in node.items()}
     dependents = defaultdict(list)
     for nid, n in node.items():
@@ -118,8 +135,8 @@ def run(w: Workload, replicas: list[StubScheduler], pools: dict[str, int],
              {t.pool for s in w.sessions for t in s.tasks if t.pool}:
         if p not in pools:
             raise ValueError(f"workload uses pool {p!r} but the config gives it no size")
-    free = dict(pools)
-    queue: dict[str, deque] = defaultdict(deque)   # pool -> (node id, pools still to take)
+    free = {(k, p): n for k in range(workers) for p, n in pools.items()}
+    queue: dict[tuple, deque] = defaultdict(deque)   # (worker, pool) -> (node id, still to take)
     t_ready: dict[str, float] = {}
 
     seq = itertools.count()
@@ -141,6 +158,7 @@ def run(w: Workload, replicas: list[StubScheduler], pools: dict[str, int],
 
     def acquire(nid, need, t):
         for i, p in enumerate(need):
+            p = (worker_of[nid], p)
             if free[p] > 0 and not queue[p]:
                 free[p] -= 1
             else:
@@ -148,10 +166,11 @@ def run(w: Workload, replicas: list[StubScheduler], pools: dict[str, int],
                 return
         start(nid, t)
 
-    def release(p, t):
+    def release(nid, p, t):
+        p = (worker_of[nid], p)
         if queue[p]:
-            nid, rest = queue[p].popleft()
-            acquire(nid, rest, t)
+            nxt, rest = queue[p].popleft()
+            acquire(nxt, rest, t)
         else:
             free[p] += 1
 
@@ -175,9 +194,9 @@ def run(w: Workload, replicas: list[StubScheduler], pools: dict[str, int],
     def done(nid, t):
         n = node[nid]
         if isinstance(n, Task) and n.pool:
-            release(n.pool, t)
+            release(nid, n.pool, t)
         for p in lease_end[nid]:
-            release(p, t)
+            release(nid, p, t)
         for d in dependents[nid]:
             waiting_on[d] -= 1
             if not waiting_on[d]:

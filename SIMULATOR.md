@@ -274,8 +274,23 @@ bundle 要能原样存成一个文件、跟着预测结果走，不然这份预�
 calibration 的 TP 和 server 的一样。030010 用的是 `flashinfer_trtllm` MoE，grid 是 `triton`，这一条会直接拒。
 
 还没做：从活 server 自动读 `args`；没有活 server 时跑 SGLang 算默认值的那段代码；group barrier 和训练段
-要的 batch、`n`、训练时长。pool 现在是所有 worker 合成一个（worker 数 × 每个 worker 的 slot），每个 worker
-各一份是下一步。
+要的 batch、`n`、训练时长。
+
+**每个 worker 各一份 pool（2026-10-13）。** verl 把一个 batch 切成连续的几块，一块给一个 agent-loop
+worker（`AgentLoopManager.generate_sequences` 里的 `DataProto.chunk`），semaphore 是每个进程自己的。所以
+engine 把 workload 里的 session 按顺序切成 worker 数那么多块，每块的 session 只用这块自己的 slot
+（`engine.split`）。块长是 `ceil(n / workers)`，和 `torch.chunk` 一样。GRPO 一个 group 的 n 条在 batch 里
+挨着，块长是 n 的倍数时一个 group 不会跨 worker。
+
+这样 session 的顺序就有了意思：它是 harness 拿到 batch 的顺序（见 `Workload.sessions` 的注释）。worker
+数和怎么切是 recipe 的事，顺序是 workload 的事。
+
+0912 的 timeline 每个 worker 一份文件，正好拿来验这条规则：step 1 八个 worker 各 256 个 session、32 个整
+group，没有一个 group 跨 worker。adapter 现在一份文件一份文件地排，同一份里按开始等 container 的时刻排
+（`admission_wait` 的 `t`，不是它等了多久）。这就是那个 semaphore 先来先得的顺序：八个 worker 里，按这个
+顺序排在前 33 个的都马上拿到了 container，后面的一个都没有。它和 batch 顺序差一点：verl 在这之前 await
+了一次 chat template，相邻的偶尔对调，所以一个 group 中间有时插进别的 group 的一两条（32 个 group 排出来
+是 32 到 36 段）。
 
 **prior 是唯一有默认的一项。** 前几行是系统配置，填错了预测就错，而且看不出来。prior 本来就是
 「估的」：它已经带着 interval，sensitivity table 会单独给它一行，报告会写它从哪来。用我们的 run
@@ -573,6 +588,36 @@ rollout 总长                        1,648 s        4,225 s           2,418 s
 - 常数 44 ms 慢 1.75 倍：44 ms 是 0912 稳态一步的中位数，拿来算尾巴的小 batch 太贵。
 - 一个样本 464 秒，比 5(b) 的 385 秒多两成，是 cost model 每步算价的开销。N=64 并行约 8 分钟。
 
+**每个 worker 各一份 pool 以后再跑（2026-10-13）。** 同一个脚本、同一份 bundle，pool 改成 8 个 worker 各
+33 个 container、4 个 eval（§5），session 按 adapter 排的顺序切块。结果在
+`analysis/20260912-072938/engine/step1-model-perworker.*`。
+
+```
+                                   pool 合成一个    每个 worker 一份    run
+session 落在 run 的那个 worker 上                    2,048 / 2,048
+后续轮次 cached_tokens 一字不差      99.63%          99.63%
+第一轮没命中自己 group 的 prefix     571             509                514
+decode 每 token，sim/run p10/p50/p90 0.67/0.86/1.14  0.73/0.85/1.01
+等 container p50/p90/max                             438/942/1,089 s    502/1,101/1,280 s
+等 eval p50/p90/max                                  42/258/790 s       17/163/755 s
+session 结束，sim/run p10/p50/p90    0.21/0.92/5.57  0.87/0.99/1.32
+rollout 总长                        1,648 s         2,301 s            2,418 s
+一次模拟的墙钟                       464 s           368 s
+```
+
+- 切块规则把 2,048 个 session 全放回了 run 里的那个 worker。
+- rollout 总长从 0.68 到 0.95。原来差的那一大截主要是 pool：32 个 eval slot 谁都能用的时候，尾巴上没人
+  排队；每个 worker 只有 4 个，尾巴就是少数几个 worker 的 eval 在排队，和 run 一样。
+- 第一轮冷的从 571 变成 509，run 是 514。上面猜的「同一个 group 的几条什么时候到」就是这个：session
+  现在按 semaphore 放行的顺序拿 container，同一个 group 的几条差不多同时开始，谁先到哪个 replica 也就和
+  run 一样了。多出来的 57 个不用 cache 热来解释了。
+- 等 container 比 run 少 14%，和 decode 快 15% 对得上：前面的 session 跑得快，slot 放得早。
+- 等 eval 反而是 run 的 1.57 倍（p50 42 s 对 17 s）。session 跑得快、container 放得早，到 eval 的时刻更挤
+  在一起，是一种解释，还没验。
+- session 结束的 p10 和 p90 从 0.21、5.57 收到 0.87、1.32：原来两头歪是因为 container 和 eval 排的队不对。
+- 剩下的 5%，方向和 decode 快 15% 一致。总长对上了不等于 cost model 对了：decode 快和 eval 多等，两边
+  正好抵掉一部分。在 decode 慢 1.5 倍的原因找到之前，这些仍然只是测量。
+
 ---
 
 ## 8. Cost model：每一步要多久
@@ -841,7 +886,7 @@ priced / actual 的中位数        稳态（B≥100）              尾巴（B<
 | token id | `src/simulator/tokens.py`：从 IR 的结构造 token id（§7） | 抽样过的 IR，加上 stub 吐出的 output id | `simulator.ir` |
 | observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
 | config bundle | `src/simulator/bundle.py`：读 bundle、查齐全、给请求填 cap（§5） | 系统配置 | `simulator.ir` |
-| engine | `src/simulator/engine/`：`sglang_stub.py`（stub 化的真 scheduler，§7）、`cost_model.py`（§8，含拟合）、`router.py`（照抄 verl）、`engine.py`（虚拟时钟、资源池）、`system.py`（从 bundle 建出 replica、pool、cost model）；group barrier、训练段待建 | 抽样过的 IR + config | `simulator.ir`、`simulator.bundle`、SGLang |
+| engine | `src/simulator/engine/`：`sglang_stub.py`（stub 化的真 scheduler，§7）、`cost_model.py`（§8，含拟合）、`router.py`（照抄 verl）、`engine.py`（虚拟时钟、每个 worker 各一份的资源池）、`system.py`（从 bundle 建出 replica、worker 和 pool、cost model）；group barrier、训练段待建 | 抽样过的 IR + config | `simulator.ir`、`simulator.bundle`、SGLang |
 | 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`，`stub_driver.py` 是 5(a)/(b) 用的合成闭环负载，`ir_driver.py` 是 5(c) 用的、把真 IR 喂进 stub 的闭环；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
 | 对答案 | 待建，放进 `src/simulator/dev/` | 两边都知道 | 全部 |
 
@@ -969,7 +1014,8 @@ priced / actual 的中位数        稳态（B≥100）              尾巴（B<
 然后 5(d) 的 engine。
 
 5(d) 先开工了（2026-10-13），因为 8 张卡凑不齐，而 engine 只用 CPU。按这个顺序：时钟、config bundle、每个
-worker 各自的 pool、group barrier 和训练段、输出和 subagent。前两样做完了（§5、§7）。decode 慢 1.5 倍的原因
+worker 各自的 pool、group barrier 和训练段、输出和 subagent。前三样做完了（§5、§7）：每个 worker 各一份
+pool 以后，0912 step 1 的 rollout 总长从 run 的 0.68 到 0.95。decode 慢 1.5 倍的原因
 找到之前，engine 的时间对答案只能当测量看，不当验收。下面是第 1 步的经过。
 
 schema 加抽样那一步——`src/simulator/ir.py`、

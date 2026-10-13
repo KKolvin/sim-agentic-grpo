@@ -1,4 +1,4 @@
-"""The system a bundle describes, built: stubbed replicas, pool sizes, a cost model (SIMULATOR.md §5).
+"""The system a bundle describes, built: stubbed replicas, workers and their pools, a cost model (SIMULATOR.md §5).
 
 Everything the bundle states is checked against what it will run on, and refused when it
 does not match: the SGLang version against the one the stub was checked on, every server
@@ -34,7 +34,8 @@ STUB_ARGS = ("device", "skip_tokenizer_init", "load_format")
 @dataclass
 class System:
     replicas: list[StubScheduler]
-    pools: dict[str, int]
+    workers: int
+    pools: dict[str, int]          # slots per worker
     cost: CostModel
     bundle: Bundle
 
@@ -74,6 +75,5 @@ def build(b: Bundle) -> System:
                              if k not in COST_ARGS and k not in STUB_ARGS})
     shape = ModelShape.from_config(sv.args["model_path"])
     return System(replicas=[StubScheduler(sa) for _ in range(sv.replicas)],
-                  # one pool across all workers, until per-worker pools land
-                  pools={p: b.recipe.workers * k for p, k in b.recipe.pools.items()},
+                  workers=b.recipe.workers, pools=dict(b.recipe.pools),
                   cost=CostModel(cal, shape), bundle=b)

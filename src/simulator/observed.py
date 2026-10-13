@@ -78,6 +78,10 @@ class ObservedSession:
     #: of a step spent in a queue ([[step-budget-and-async-math]]).
     waits_s: dict[str, float] = field(default_factory=dict)
 
+    #: The harness process that ran it, when the trace says: what the engine's split
+    #: of the session order across workers (§5) is checked against.
+    worker: str | None = None
+
 
 @dataclass(frozen=True)
 class ObservedGauge:
