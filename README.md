@@ -1,103 +1,52 @@
-# Multi-turn Agentic GRPO RL Training Pipeline
+# sim-agentic-grpo
 
-Synchronous **GRPO** (Group Relative Policy Optimization) training for a
-multi-turn coding agent evaluated on **SWE-bench**.
+This repository trains a multi-turn coding agent with synchronous GRPO on SWE-bench, and simulates how long one of those training steps takes when the system around the agent changes.
 
-- **Model:** Qwen3-30B-A3B-Instruct-2507 (`/data0/shared/Qwen3-30B-A3B-Instruct-2507`)
-- **Dataset:** SWE-bench_Verified (`SWE-bench/SWE-bench_Verified`), 500 instances, 3 epochs
-- **Hardware:** 8× NVIDIA B200
-- **RL framework:** [verl](https://github.com/verl-project/verl) (actor / ref / GRPO)
-- **Rollout engine:** [SGLang](https://github.com/sgl-project/sglang), synchronous (`policy_lag = 0`)
-- **Agent + environment:** [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) + dockerized SWE-bench env
-- **Reward:** binary outcome — `1.0` if resolved, else `0.0`
-- **Batch size:** 256 | **Context length:** 16384
+The training run is the workload. It produces the traces, timelines, and cost-model measurements. The simulator replays that work on a different machine, parallelism, or concurrency and reports the step time and the timeline, without launching another run.
 
+## Training
 
+`src/agentic_grpo` is a [verl](https://github.com/verl-project/verl) agent loop. Each sampled prompt is one episode: the model generates, the loop parses a tool call, a tool runs inside a SWE-bench Docker container, the observation is appended, and this repeats until the agent submits a patch or hits a turn or context limit. [SGLang](https://github.com/sgl-project/sglang) serves the rollout synchronously (`policy_lag = 0`). The reward is binary: `1.0` if the official SWE-bench harness says the patch resolved the instance, otherwise `0.0`. verl then computes the GRPO advantage and updates the actor.
 
-## Setup
+The run this repo is set up for:
 
-```bash
-# sglang (0.5.8) pins transformers==4.57.1, while verl 0.9.0 *declares*
-# transformers>=5.5.3 -- a floor its code does not actually need on this path
-# (it still carries 4.5x version gates). So install verl without its deps:
-git clone https://github.com/volcengine/verl /data0/shared/$USER/verl
-git -C /data0/shared/$USER/verl checkout release/v0.9.0
-pip install "sglang[all]==0.5.8"
-pip install -e /data0/shared/$USER/verl --no-deps   # verl 0.9.0, editable
-pip install -e .
-```
+| | |
+| --- | --- |
+| Model | Qwen3-30B-A3B-Instruct-2507 |
+| Data | SWE-bench Verified, 500 instances, 3 epochs |
+| Hardware | 8× NVIDIA B200 |
+| Agent | [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) tools (`bash`, editor, `submit`) |
+| Batch | 256 prompts × 8 samples |
 
-verl is pinned to the **`release/v0.9.0`** branch, not the 0.8.0 wheel: 0.8.0
-OOMs at the SGLang weight sync (`resume_memory_occupation` ->
-`cu_mem_create: out of memory`), which killed the 4-GPU run on 2026-07-30 and
-the 8-GPU run 20260908-052218 at step 2. 0.9.0 carries both fixes —
-`aggressive_empty_cache()` before `rollout.resume(tags=["weights"])`
-(commit d908005d) and `enable_weights_cpu_backup` for HYBRID rollout mode —
-and `trainer.use_v1=false` in the config keeps the run on the legacy
-`RayPPOTrainer` path this repo hooks.
+Every episode records tokens, turn timings, and a timestamped timeline of rollout and training. Those records are what the simulator is checked against. Setup and the launch script are in [TRAINING.md](TRAINING.md). What each logged number means is in [METRICS.md](METRICS.md).
 
-Docker is required for SWE-bench instance images.
+## Simulator
 
-## Run
+`src/simulator` is a trace-driven discrete-event simulator of one GRPO step. A trace says what work there was. An adapter turns it into an IR of sessions, requests, tool tasks, and resource leases. A config bundle says what system runs that work: SGLang replicas, tensor-parallel size, KV cache, concurrency caps, container and eval slots, and a cost model fitted on a measured grid. The engine then runs the work on that system.
 
-```bash
-# 1. Prepare a gradable dataset from Hugging Face (SWE-bench_Verified by default).
-python scripts/prepare_swebench_hf.py
+The scheduler is SGLang's own scheduler, with the model worker stubbed out. Each forward is priced by the cost model. Container starts, tool calls, and grading take their durations from the trace, or from priors when the trace did not record them. The clock follows SGLang's overlap schedule: a request's arrival is when the previous turn finished generating plus the tool time from the trace, not a timestamp copied out of a previous run.
 
-# 2. Launch GRPO training (3 epochs, auto-computes total_steps).
-bash scripts/run_grpo.sh
-```
-
-
-## Architecture
+It answers changes that leave the token stream alone: tensor-parallel size, replica count, concurrency cap, KV dtype, hardware. A change that would make the model write something else — a different turn cap, tool set, prompt, or model — is outside what a replay of an old trace can say, and the simulator is built to refuse those questions. The design contract, including which numbers may be inputs and which the engine has to compute, is [SIMULATOR.md](SIMULATOR.md). An example bundle is [configs/simulator/example_bundle.yaml](configs/simulator/example_bundle.yaml).
 
 ```
-   verl trainer (Ray) ──── weights, policy_lag=0 ────▶  SGLang rollout server
-          │                                                      ▲
-          │ one AgentLoop.run() per sampled prompt               │ token-in / token-out
-          ▼                                                      │
-   ┌─────────────────────────────────────────────────────────────┴──────┐
-   │ agent_loop.py   SWEBenchAgentLoop                                  │
-   │   generate ─▶ parse <tool_call> ─▶ run tool in docker ─▶ append obs│
-   │   tools registry (tools.py): bash_tool.py | editor_tool.py         │
-   │   ends on submit marker / turn limit / context limit ─▶ patch      │
-   └───────────────┬────────────────────────────────────┬───────────────┘
-                   │ patch                              │ TrajectoryMetrics + timeline events
-      ┌────────────▼─────────────┐         ┌────────────▼──────────────────────────┐
-      │ reward.py                │         │ metrics.py · timeline.py              │
-      │ swebench harness → 0/1   │         │ sglang_timing.py · server_monitor.py  │
-      └────────────┬─────────────┘         └───────────────────────────────────────┘
-                   ▼
-      reward on last token ─▶ verl GRPO advantage ─▶ actor update ─▶ weight sync ↺
+trace ── adapter ──▶ IR (the work)  ──┐
+                                      ├──▶ engine ──▶ predicted timeline, step time
+config bundle ────────────────────────┘
 ```
 
 ## Layout
 
-
-| Path                                     | Role                                  |
-| ---------------------------------------- | ------------------------------------- |
-| `src/agentic_grpo/config.py`             | AgentConfig + container env resolution |
-| `src/agentic_grpo/agent_loop.py`         | verl AgentLoop: the rollout as phases (admit → step* → release → grade) |
-| `src/agentic_grpo/episode.py`            | One rollout's state + record: tokens, turn timings, metrics, timeline, dump |
-| `src/agentic_grpo/tools.py`              | Tool registry: which tools are active, one `Tool` adapter each; `AGENTIC_EDIT_TOOL=0` drops the editor from schemas, prompts and nudges alike |
-| `src/agentic_grpo/bash_tool.py`          | `bash`: mini-swe-agent's schema + container exec, Qwen3 argument aliases, command policy (installs/network, servers, whole-repo lint refused), timeout wording |
-| `src/agentic_grpo/editor_tool.py`        | `str_replace_based_edit_tool`: view/create/str_replace/insert over base64 file I/O |
-| `src/agentic_grpo/submit_tool.py`        | `submit`: ends the episode with `git diff <base_commit>` as the patch (also the end-of-episode fallback); `AGENTIC_SUBMIT_TOOL=0` restores the marker protocol |
-| `src/agentic_grpo/tool_calls.py`         | Sampled text → (tool, args): strict parse + salvage |
-| `src/agentic_grpo/metrics.py`            | Per-trajectory metrics (client-side)  |
-| `src/agentic_grpo/server_monitor.py`     | Server-side latency/drain (SGLang `/metrics`) |
-| `src/agentic_grpo/sglang_timing.py`      | Per-request queue/prefill/decode timestamps |
-| `src/agentic_grpo/timeline.py`           | Run timeline: every rollout + training event, timestamped |
-| `src/agentic_grpo/reward.py`             | Binary SWE-bench reward               |
-| `configs/grpo_swebench.yaml`             | verl trainer config                   |
-| `configs/agent.yaml`                     | mini-swe-agent loop config            |
-| `scripts/prepare_swebench_hf.py`         | Download + convert a gradable SWE-bench set to parquet |
-| `scripts/prepare_one.py`                 | 1-instance parquet + docker image name (smoke test) |
-| `scripts/run_grpo.sh`                    | Launch training                       |
-| `scripts/build_timeline.py`              | Merge a run's timeline shards into one `timeline.json` |
-
-
-
+| Path | Role |
+| --- | --- |
+| `src/agentic_grpo/` | The verl agent loop, tools, SWE-bench reward, metrics, and timeline |
+| `src/simulator/` | Trace adapters, IR, cost model, and the timeline engine |
+| `configs/grpo_swebench.yaml` | verl trainer config for the 8× B200 run |
+| `configs/simulator/` | Simulator config bundles |
+| `scripts/run_grpo.sh` | Launch training |
+| `scripts/measure_cost_grid.py`, `scripts/fit_cost_model.py` | Measure and fit the forward-pass cost model |
+| `scripts/priors_template.py`, `scripts/show_priors.py` | List prior knobs and what a bundle resolves them to |
+| `scripts/simulator_dev/` | Checks of the simulator against our own runs |
+| `analysis/` | Per-run metrics, timelines, and simulator reports |
 
 ## Tests
 
@@ -105,7 +54,4 @@ bash scripts/run_grpo.sh
 pytest -q
 ```
 
-The suite has no verl/sglang/CUDA dependency — `agent_loop.py` falls back to
-attribute-compatible stubs for verl's `AgentLoopBase`/`AgentLoopOutput` when the
-import fails, so the unit tests run on a bare laptop checkout.
-
+The agent-loop tests stub verl when it is not installed, so they run without CUDA. The scheduler tests that drive a real SGLang `Scheduler` skip themselves unless the model config is on disk.

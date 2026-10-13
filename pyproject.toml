@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentic-grpo-swebench"
 version = "0.1.0"
-description = "Synchronous multi-turn GRPO RL pipeline for a SWE-bench coding agent."
+description = "Multi-turn GRPO for a SWE-bench coding agent, and a trace-driven simulator of one training step."
 requires-python = ">=3.10"
 readme = "README.md"
 
