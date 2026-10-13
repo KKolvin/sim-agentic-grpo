@@ -198,6 +198,15 @@ class CostModel:
             return self.extend(extend_lens, prefix_lens)
         return 0.0
 
+    def price(self, st) -> float:
+        """Seconds for one forward the stubbed scheduler launched (an engine ``Price``)."""
+        return self.step(st.mode, st.seq_lens, st.extend_lens, st.prefix_lens)
+
+    @property
+    def outside_share(self) -> float:
+        """Share of priced forwards that fell outside the measured grid (§8 refuses above 5%)."""
+        return self.outside / self.priced if self.priced else 0.0
+
 
 # ---------------------------------------------------------------------------
 # fitting

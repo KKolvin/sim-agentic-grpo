@@ -213,6 +213,11 @@ replica = 1,060，跟 1,118 对得上——每个 group 在每个 replica 上冷
 不许根据 provenance 改变行为」就不用靠自觉：到 engine 手里的时候，估的数和实测的数就是同一个
 float，想区别对待也没得区别。`prov` 跟着 workload 一路走进报告，engine 从不读它。
 
+**lease 两端的 task 不再自己要 slot。** 起容器的 task 是在 session 的 container lease 里跑的，
+`pool` 必须是 None。两个 adapter 原来都给它写了 `pool="container"`，等于一个 episode 要两个 slot：
+session 比 slot 多的时候，每个 lease 拿着一个、等第二个，谁也跑不了。64 个 session 时看不出来，
+喂 0912 step 1 的 2,048 个 session 时卡死了。现在 `validate` 拒这种写法。
+
 **一个 node 可以等好几个 node。** `after` 是一个 list。一个 assistant turn 并行发三个 tool call、
 下一轮等三个都跑完，这在别的 harness 里是常态；串成一条链就是凭空加依赖，把 session 拉长。
 
@@ -248,6 +253,29 @@ IR 只装 workload，不装系统配置：`Lease` 只说要哪个 pool，不说 
 
 **一项都不许拿「常见默认值」顶。** SGLang 很多默认值是按 GPU 显存分支的，照抄就是在编。整个
 bundle 要能原样存成一个文件、跟着预测结果走，不然这份预测没法复现。
+
+**落地了的部分（2026-10-13）。** 读文件、查齐全在 `src/simulator/bundle.py`；拿 SGLang 和 calibration
+核对、建出 replica 在 `src/simulator/engine/system.py`。例子是 `configs/simulator/example_bundle.yaml`，
+0912 自己的是 `configs/simulator/run-20260912-072938.yaml`。一个文件四段：
+
+- `recipe`：worker 数；每个 pool 每个 worker 几个 slot，pool 名字用 workload 里的；`request_cap`，trace
+  没记 `max_new_tokens` 的请求按 `min(max_new_tokens, max_sequence_tokens − prompt, context_length − 1 − prompt)`
+  填（verl 的规则写成通用的样子），prov 记 `config`。填完要是有请求写得比 cap 还多，说明这条 trace 不是在
+  这份配置下跑的，拒。
+- `server`：SGLang 版本、replica 数、`args`、`env`。`args` 用 SGLang 自己的字段名，和活 server 的
+  `/get_server_info` 一样；必填的是 scheduler 做决定要用的那些，加上 cost model 要对上的几项。不是
+  `ServerArgs` 字段的名字直接拒，拼错了不会悄悄用默认值。`env` 是 `new_token_ratio` 那三个环境变量，
+  server 没设也要把 SGLang 的默认值写上。
+- `calibration`：拟合好的 `calibration.json`。路径相对 bundle 文件，不相对当前目录。
+- `priors`：同上，由 `load_priors` 读。
+
+建 system 时查三件事，哪件对不上都拒：SGLang 版本和 stub 的一样；`tp_size`、`attention_backend`、
+`moe_runner_backend`、`kv_cache_dtype`、`disable_cuda_graph` 和 calibration 那份 grid 的 `meta.json` 一样；
+calibration 的 TP 和 server 的一样。030010 用的是 `flashinfer_trtllm` MoE，grid 是 `triton`，这一条会直接拒。
+
+还没做：从活 server 自动读 `args`；没有活 server 时跑 SGLang 算默认值的那段代码；group barrier 和训练段
+要的 batch、`n`、训练时长。pool 现在是所有 worker 合成一个（worker 数 × 每个 worker 的 slot），每个 worker
+各一份是下一步。
 
 **prior 是唯一有默认的一项。** 前几行是系统配置，填错了预测就错，而且看不出来。prior 本来就是
 「估的」：它已经带着 interval，sensitivity table 会单独给它一行，报告会写它从哪来。用我们的 run
@@ -420,6 +448,35 @@ trace 越差，interval 越宽，但不会突然算不出来。
 的 prompt id 加 stub 实际吐出的 output id，截到 `shared_prefix_tokens`。这件事在 workload 那一侧做，
 SGLang 看到的只是 token 序列。
 
+代码在 [src/simulator/tokens.py](src/simulator/tokens.py)：新的一段由 (类别, id) 当种子生成，`Prefix`
+是父亲的 id 接上自己那段，请求的 prompt 是父亲内容的前 `shared_prefix_tokens` 个接上自己那段。父亲的
+内容要等它跑完才知道，所以 stub 的 `Finished` 带着 SGLang 实际发回来的 output id（含 EOS），由
+driver 交回来。一条请求的 id 只留到它最后一个孩子造完。
+
+**拿 0912 step 1 验过（2026-10-07）。** 脚本 `scripts/simulator_dev/feed_workload.py`，driver 在
+`src/simulator/dev/ir_driver.py`（不是 engine：每步耗时是常数，pool 只是全局计数器，router 照抄
+verl）。48,258 个请求、两个 replica，一个进程 389 秒跑完，没有 retraction。逐个请求比 `cached_tokens`：
+
+```
+                       请求数    和 run 一样    差不超过一页    总命中率 stub / run
+后续轮次               46,210    99.63%         100%            0.957 / 0.957
+第一轮，没有共享根      2,038    63.1%                          0.719 / 0.839
+第一轮，有共享根        2,038    78.1%                          0.819 / 0.839
+  其中两边都命中        1,276    100%
+```
+
+- 后续轮次就是 §3 那条规则：run 里有 0.37% 多命中一整页，stub 一次都没有。原因还不知道。
+- 第一轮差的那一大块是 system prompt。timeline 没有文本，adapter 不知道所有 group 共享开头的
+  1,045 个 token（system prompt 加 tool schema），每个 group 的 `Prefix` 都是一整段独立的。run 里
+  514 个冷的第一轮全部恰好命中 1,024 个 token，就是它按页取整。1,045 这个数是拿 run 当时的 commit
+  （b2f97c8）的 harness 模板配 Qwen3 tokenizer、渲染两道不同的题、取公共前缀算出来的，没有看答案。
+  `--shared-root 1045` 在所有 group 的 `Prefix` 上面挂一个共享的根。
+- 加了根以后，剩下的差别都取决于时间：同一个 group 的哪一条先到哪个 replica，前一条 prefill
+  完了没有。stub 里冷的第一轮 572 个，run 里 514 个；stub 有 509 个 (group, replica) 组合，多出来的
+  是几乎同时到的两条都没命中。每步耗时现在是常数，这一项要等 5(d) 接上 cost model 再对。另外
+  stub 里有 14 个第一轮连 system prompt 都没命中，run 里一个都没有：run 的 step 1 之前跑过
+  validation，cache 已经是热的。
+
 **SGLang 会不会偷看真实时钟？** 查过源码，scheduler 路径上会影响行为的只有三处：
 
 - `SGLANG_QUEUED_TIMEOUT_MS`（默认关，`scheduler.py:1708`）：开着的话会按真实时间踢掉排队太久的
@@ -432,6 +489,10 @@ SGLang 看到的只是 token 序列。
 
 **router 不在 SGLang 里。** 它是 verl 的 `GlobalRequestLoadBalancer`（`src/agentic_grpo/agent_loop.py:322`）：
 同一个 id 来过就发回同一台，没来过就挑当前 load 最小的那台。几十行，照抄进 engine。
+
+**0912 的 `chunked_prefill_size` 是 16384，不是 8192。** verl 不把 `max_num_batched_tokens` 传给
+SGLang，所以用的是 SGLang 在 B200 上的默认值。5(b) 的 bench 写的是 8192，那 385 秒照旧成立，但
+喂真 workload 时要用 16384。
 
 **要从 config 读的 scheduler 参数：** `schedule_policy`（我们是 `fcfs`）、`schedule_conservativeness`
 （1.0）、`chunked_prefill_size`、`max_running_requests`、`page_size`（64）、`new_token_ratio` 的
@@ -466,37 +527,84 @@ SGLang 看到的只是 token 序列。
 所以 engine 走单进程：一个样本的所有 replica 放在一个进程里，由同一个虚拟时钟推进；并行发生在
 样本之间，不在 replica 之间。
 
+**engine 的时钟（2026-10-13）。** 代码在 `src/simulator/engine/engine.py`。比 5(c) 的 driver 多的是时钟：
+每次 forward 多久由一个 price 函数给（cost model，或者常数），每个 replica 的时间照 SGLang 自己的 event
+loop 走。CPU 时间算 0，因为 standalone server 上量过，overlap 把它盖住了（§8）。
+
+- 不开 overlap：一轮在 T 组 batch、跑、处理结果。batch 在 T 加上它的耗时结束，跑完的请求这时离开，下一轮
+  这时开始。
+- 开 overlap（我们的 run 都开着）：一轮在 T 组 batch i、发出去，再处理 batch i−1 的结果，这要等 i−1 跑完。
+  batch i 在 max(T, i−1 结束) 开始；i−1 里跑完的请求也在这一刻离开，下一轮也在这一刻开始。所以每个 batch
+  都是上一个还在跑的时候组的：batch i 跑的时候到的请求，要到 batch i+2 才进得去，比不开 overlap 多等一个
+  batch。请求自己的 token 不受影响：一条请求单独跑、写 n 个 token，两种模式都是 n 个 batch 的时间，overlap
+  只是多跑一次用不上的 decode（EOS 还没回来）。
+- 第一个 token 的时刻，是 prefill 完 prompt 最后一段的那次 forward 的结果被处理的时刻。SGLang 在那里打
+  `prefill_finished_ts`。
+
+5(c) 的 driver 在 overlap 下把跑完的请求晚记了一个 batch，也没有「提前一个 batch 组」这件事。不开 overlap
+时两者应该一样，也确实一样：同一份 workload、常数耗时，每一步的 batch、每个请求的结果和 driver 一字
+不差。overlap 那几条各有一个 test，真 scheduler 跑出来的数和上面推的一样（`tests/test_simulator_engine.py`）。
+
+要是 run 里 decode 慢的原因是 overlap 没盖住的 CPU，就在上面两个 max 里加一项每轮的 CPU 时间。
+
+**拿 0912 step 1 跑了一遍（2026-10-13）。** 脚本 `scripts/simulator_dev/simulate_step.py`，用 0912 的 bundle，
+`--shared-root 1045`，结果在 `analysis/20260912-072938/engine/`。pool 还是所有 worker 合成一个的（container
+264、eval 32），session 什么时候拿到 container、eval 排多久都和 run 不一样，所以跟时间有关的数只能当测量看。
+
+```
+                                   cost model     每步常数 44 ms     run
+一次模拟的墙钟（一个进程）          464 s          450 s
+后续轮次 cached_tokens 一字不差      99.63%         99.63%
+第一轮没命中自己 group 的 prefix     571            573               514
+TTFT p50                           0.073 s        0.108 s           0.130 s
+每个请求 decode 每 token p50         0.038 s        0.072 s           0.044 s
+session 结束 p50                     653 s          1,109 s           680 s
+rollout 总长                        1,648 s        4,225 s           2,418 s
+```
+
+- 时钟不动结构：后续轮次的命中和 5(c) 一样。
+- 第一轮冷的多出来 57 个，换成 cost model 也没变（5(c) 是 572），所以不是每步多久的问题。剩下的嫌疑是
+  run 的 step 1 之前跑过 validation、cache 是热的，和同一个 group 的几条什么时候到（container 起得多快）。
+- 每个请求的 decode 每 token 只比 run 快 14%（p50），不是第一级说的 1.5 倍。两边 batch 的组成不一样（模拟
+  跑得快，同一时刻在跑的请求不同），这个数里还含着被别的请求 prefill 打断的时间，所以和第一级不矛盾，但
+  也说明 1.5 倍得在同样的 batch 上比才看得出来，第一级就是这么比的。
+- 总长 0.68 里不全是 cost model：eval 现在 32 个 slot 谁都能用，run 里每个 worker 只有 4 个，尾巴上是少数
+  几个 worker 的 eval 在排队。下一步每个 worker 各一份 pool，先把这一块分出来。
+- 常数 44 ms 慢 1.75 倍：44 ms 是 0912 稳态一步的中位数，拿来算尾巴的小 batch 太贵。
+- 一个样本 464 秒，比 5(b) 的 385 秒多两成，是 cost model 每步算价的开销。N=64 并行约 8 分钟。
+
 ---
 
 ## 8. Cost model：每一步要多久
 
-整个 simulator 只有这一条式子：
+一个 step 是 scheduler 的一次 forward。最早这里只有一条式子，`T = (W_bytes + KV_bytes) / (BW × eta(B,
+ctx, prefill_len)) + overhead`，拿 batch 大小和平均 context 去查一张 `eta` 表。2026-10-07 在 grid 上量完、
+又拿 run 0912 对过答案（§12），这条式子只解释了 run 31% 的时间。现在的形式按 kernel 实际怎么跑来写，
+代码在 [src/simulator/engine/cost_model.py](src/simulator/engine/cost_model.py)：
 
 ```
-T_step = (W_bytes + KV_bytes) / (BW × eta(B, ctx, prefill_len)) + overhead
+DECODE  T = routing(B) × base(B) + attention(ctx_1 … ctx_B)
+EXTEND  T = max( floor,  a + b × 新 token 数 + c × Σ 新 token × (prefix + 新 token / 2),  d + e × 最长那条 )
 ```
 
-- 一个 step 是 scheduler 的一次 forward。
-- `W_bytes`：这一步要读的权重字节，从模型 `config.json` 算。
-- `KV_bytes`：这一步要读的 KV 字节，由当前 batch 里所有请求的 context 长度算。包括
-  `num_kv_heads < tp` 时 KV 被复制的情况。
-- `BW`：HBM 带宽，硬件规格。
-- `eta`：这块硬件上、这个 engine 实际跑到了带宽上限的几成。没人写在任何地方，只能测。
-- `overhead`：每一步的固定开销。
+- `base(B)`：不算读 context 的那部分，权重、MoE、其余。每个量过的 B 一个数，中间插值。
+- `attention`：trtllm-gen 的 decode kernel 给每条序列、每个 KV head 分同样多的 CTA，份数是
+  `max(1, SM 数 // (B × 每卡 KV head 数))`，再以 `ceil(最长 context / 256)` 为上限（flashinfer
+  `fmhaKernels.cuh` 的 `numCtasPerSeqKv`）。这些 CTA 按 batch 顺序上 SM，一个 SM 一个，做完一个补一个；
+  同时在跑的平分 HBM 带宽（`kv`，每 token 多少秒），但每个都快不过一个 CTA 自己的速度（`cta`，每个
+  head 每 token 多少秒）。份数照 kernel 的规则算，SM 数从硬件读，不拟合。
+- `routing(B)`：grid 的点不真跑 prefill，KV 是填进去的，MoE 路由和真文本不一样；这是真文本 prefill
+  和填 KV 的耗时之比，在能真跑的小点上量。
+- EXTEND 三项：`floor` 是 eager forward 本身（decode 走 CUDA graph，extend 一个一个 launch 约 800 个
+  kernel）；中间一项是算力；最后一项是 context attention 的 critical path：新 token 少时一条序列只有
+  很少几个 CTA，每个都要读完整个 prefix。
+- `overhead`（scheduler 的 CPU）不在式子里：在 standalone server 上量过，overlap 调度下它被 GPU 那一步
+  盖住了（见下）。
 
-需要拟合的只有三个量：`eta`、`overhead`、prefill 的耗时曲线。prefill 曲线其实就是同一张 `eta`
-表在「batch 小、prefill 长」那一角的样子，不是第二个模型。`cuda_graph_max_bs` 和 capture 的
-batch 档位从 config 读，step 耗时的台阶就在那里。
-
-**`eta` 里还包了什么。** 一步里除了读 HBM 之外的所有耗时——kernel 没跑满、launch 开销、TP 的
-allreduce——都没单独建模，全折进 `eta`。单机内的 allreduce 走 NVLink，又小又稳，只跟 batch 大小
-有关，所以测 `eta` 时顺带就测进去了。也正因为这样，**`eta` 是按 TP 配置测的**：TP=4 测出来的
-不能直接拿去算 TP=8。
-
-**拟合 `eta`，不拟合时间。** 时间的量级跟 workload 有关，extrapolate 出去会离谱；`eta` 没有单位、
-有上下界、变化平滑，是 engine 加硬件的属性。它还把一直没解开的那个 3.7x 差距变成了一个能打印的数：
-在 p50 稳态，每个 replica 每一步每张卡读约 43GB 的 KV，花 44ms，算下来 `eta ≈ 0.12`（按 8TB/s）；
-standalone 跑同样的点大约 0.5。同一个测量点两个数，差的就是那个 gap。
+拟合的量：`base(B)` 的表、`kv`、`cta`、`routing(B)` 的表、EXTEND 的六个数。都是机器加 engine 的属性，
+**按 TP 配置各拟一份**：单机内的 allreduce、kernel 没跑满、launch 开销都折在里面，TP=4 的不能拿去算
+TP=8。`scripts/fit_cost_model.py` 打印对应的 `eta`（`kv` 折算的 KV 带宽、`base` 折算的权重带宽），让数
+有个物理上的参照；拟合的是时间，不是 `eta`，因为 `attention` 那部分不是「字节除以带宽」能写出来的。
 
 **只在专门设计的 grid 上测，绝不在 run trace 上拟合。** 原因是 run trace 里 batch 大小和 context
 长度几乎完全反相关（`corr = -0.845`）：rollout 尾巴上还没跑完的，恰好是最长的那些 episode。
@@ -513,19 +621,52 @@ trace 只覆盖了二维空间里的一条对角线。在这上面拟合，分�
 换一个不在对角线上的 workload 就是 extrapolate。所以 grid 要在 `batch × context × prefill 长度`
 三个方向上各自独立地铺开，范围按 engine 能跑的来，不按这条 trace 碰到的来。
 
-**grid 外面不 extrapolate。** `eta` 只在 grid 内 interpolate。落在 grid 外的 step 不给估计，标出来，
+**grid 外面不 extrapolate。** `base(B)` 这类表只在量过的范围里插值。落在 grid 外的 step 不给估计，标出来，
 并报离最近的测量点多远、在哪个方向出界。这种 step 超过一定比例（默认 5%）就整份拒绝报数。
 借别的机器上的测量结果也一样，距离必须打印出来——没在这台机器上验过的 `eta` 算出来的 e2e，
 跟编的没区别。
+
+**测过的（2026-10-07）。** grid 脚本 `scripts/measure_cost_grid.py`：standalone 的 `ModelRunner`，
+server args 照 run 0912 的（`trtllm_mha`、triton MoE、page 64、max running 256），其余交给 SGLang 在这块
+卡上自己算默认值。每个点的 prefix KV 直接从 allocator 里分，不跑长 prefill，然后计时一次 EXTEND 和 16 步
+DECODE。TP=4、2、1 各一份，在 `analysis/costgrid/b200-tp<N>/`，拟合结果在同目录的 `calibration.json`。
+GPU 7 当时不在 `nvidia-smi -L` 里，TP=8 没测。
+
+- **噪声。** 同一个 grid 跑两次（两个进程），每个点之比 p50 +2%、p90 +6%。旁边几张卡同时跑别的 grid 时
+  慢了 7%，所以 grid 一次只跑一个。一次 26 万 token 的 EXTEND 让 TP=4 四个 rank 全卡死在 0% GPU，
+  真 prefill 的对照点控制在 13 万 token 以内。
+- **整齐的 batch，KV 是满带宽读的。** TP=4 拟出 `kv` = 3.25 ns/token，每卡 24 KiB/token，折合 7.56 TB/s。
+  `eta` 低是 `base` 那部分：B=224 时权重只跑到 0.23。TP=2、1 折出来超过 8 TB/s，是短 context 的几个点
+  不随 context 单调（像是 kernel 换了变体）把斜率带歪了，按 ctx≥4k 算是 7.4 TB/s 左右。
+- **最长那条请求决定一步。** TP=4 下 127 条 2k 加一条 64k，一步从 7.5 ms 涨到 20.1 ms，多读的 KV 按带宽
+  只该多 0.2 ms。B≥75 时每条序列只有一个 CTA，一个 CTA 只能读约 125 GB/s（`cta` = 197 ns/token，
+  TP=2、1 也是 180 到 200）。上面的 `attention` 只用整齐 batch 和「一条长的」两组点拟合，lognormal 的
+  90 个点完全留着检验：平均误差 4.0%，p10 -8%。只取 `max(带宽项, 最长那条项)` 的写法 p10 是 -18%：
+  B 超过 SM 数时 CTA 要分波，长的那个可能排在第二波。
+- **EXTEND 的下限。** 新 token 不超过 1,024 时 TP=4 约 34 ms，TP=1 约 27 ms。profile 一次 16 个 token、
+  16k prefix 的 EXTEND：818 个 kernel，TP=4 下 9.5 到 27.5 ms 是 lamport allreduce 在 GPU 上自旋等别的
+  rank；TP=1 没有 allreduce 也有下限，所以主要是 eager forward 本身慢（`enable_piecewise_cuda_graph`
+  默认关）。prefix 长到 49k、64k 时下限也压不住了：64k prefix 上 256 个新 token 要 45 ms，按最长那条
+  每 token 0.54 µs 涨。EXTEND 拟合在 435 个点上平均误差 8.6%，小 extend 自己重复测量就差 11%。
+- **路由。** 一开始的对照是「真 prefill 随机 token」，它比填 KV 快 10% 到 35%，于是以为是填 KV 偏了。
+  拿 030010 对话 dump 重建的真 token（`scripts/simulator_dev/dump_real_token_ids.py`）再测，真文本
+  prefill、从真文本复制过来的 KV、随机填的 KV 三者相差不多，偏的是随机 token 那个参照。剩下的差别
+  （真文本比填 KV 慢）TP=4 下最多 5.5%，TP=1 最多 13%，就是 `routing(B)`，三个 seed 平均。
+- **scheduler 的开销。** `scripts/measure_server_overhead.py` 用 run 的参数起一个真 server，读它自己每
+  40 步打的 decode 日志：B 从 1 到 224、ctx 2k 和 16k，每步只比 grid 预测的 GPU 时间多 0 到 5%，
+  `return_logprob` 开不开差不到 1%。overlap 调度把 CPU 那份全盖住了，所以 `overhead` 不进式子。
+
+---
 
 ---
 
 ## 9. 其他部分
 
-**router**：见 §7。每个请求实际落在哪个 replica，我们的 run 现在没记。这是自家 run 最大的
-instrumentation gap：没有它，§12 的第二级没法逐请求对答案。补它的成本是在 `generate` 事件里加一个字段。
+**router**：见 §7。每个请求实际落在哪个 replica，2026-10-04 起 `generate` 事件里有 `replica` 这个字段，
+030010 有，0912 和更早的 run 没有。§12 的第二级要逐请求对答案，得用带这个字段的 run。
 
-**KV pool**：TP=4 下每个 replica 的 `max_total_num_tokens` 是 4,560,512。实测 KV 占用 p50 0.38、
+**KV pool**：TP=4 下每个 replica 的 `max_total_num_tokens` 是 4,560,512（训练进程和它共用显存；
+同样的 args 单独起 server 是 5,145,984，所以这个数要从 run 读，不能自己起一个算）。实测 KV 占用 p50 0.38、
 p99 0.47，这是 simulator 要算出来的。
 
 **非 GPU 资源**：
@@ -629,6 +770,60 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 
 所以按秒采样的曲线上，要求比 ~17% 更准没有意义；中位数上 ~3% 就是底。验收标准定在这里。
 
+**第一级做过了（2026-10-07 做，2026-10-13 改正）。** 脚本 `scripts/simulator_dev/validate_cost_model.py`，
+run 0912 step 1 和 030010 step 1–3。不是模拟：排程用真实的，只有每次 forward 的耗时是 cost model 给的。
+
+每条请求落在哪个 replica：030010 记了（`generate` 事件 2026-10-04 起带 `replica`），直接用，running 数和
+srv-metrics 比中位数差 1.1%、p90 差 2.8%。0912 没记，但 verl 的 router 是确定的（同一个 session 回原来
+那台，否则挑 in-flight 最少的），照 timeline 里请求开始和结束的先后重放出来，中位数差 3.1%，p90 差 26%。
+
+然后在两次 srv 采样之间（约 1 秒）把这台 replica 实际做的活算一遍价：哪些请求在 decode、各自 context
+多长、出了多少 token，以及哪些 EXTEND（按 `chunked_prefill_size` 切块）。算出来的时间除以窗口的实际长度。
+
+**哪些请求是同一次 EXTEND。** SGLang 在处理结果的循环里一条一条地打 `prefill_finished_ts`，中间夹着
+radix insert，同一次 forward 的几条请求时间戳能差出 10 ms。原来按 `decode_start` 取到毫秒分组，一次
+forward 被拆成好几批，每批都付一次 34 ms 的下限。030010 相邻时间戳的间隔分成干净的两团：0.1 到 12 ms，
+然后直到 34 ms 才又有，中间几乎是空的。所以现在间隔小于 20 ms 的连成一次 forward（`--same-forward-ms`）。
+原来那份 1.00 就是拆批拆出来的。
+
+```
+priced / actual 的中位数        稳态（B≥100）              尾巴（B<100）
+0912 step 1，原来的分法          1.00                       0.72
+0912 step 1                     0.75（门槛 12 ms 时 0.79）  0.69
+030010 step 1 / 2 / 3           1.09 / 1.09 / 1.06          0.66 / 0.76 / 0.65
+
+0912 稳态：时间里 decode 0.42、extend 0.33；B 122，ctx 均值 16.9k、最长 54.6k，每秒 8.8 次 extend（原来数成 16.6）
+0912 尾巴：decode 0.52、extend 0.13；B 17，ctx 均值 42.7k
+030010 稳态：decode 0.22、extend 0.84；B 215
+```
+
+- **0912 稳态没对上，只解释了 75% 到 79%。** 原来 extend 多算了将近一倍，正好填上 decode 少算的那块。
+  所以「server 59% 的时间在做 EXTEND」也不对，是 33% 到 36%。给 extend 开 piecewise CUDA graph 还是
+  值得试，收益要按这个数估。门槛从 1 ms 往上，结果是 0.97、0.86、0.79，到 12 ms 以上才稳。0912 的
+  replica 是重放的，门槛越大越容易把另一台的请求并进来，所以报 0.75 到 0.79 这一段。
+- **尾巴的差距跟 router 重放没关系。** 030010 只有一个 replica，routing 一点都不用猜，尾巴照样是 0.65 到 0.76。
+- **两份 run 都指向 decode 少算了。** grid 上 8k 到 16k 新 token 的 extend 误差在 2% 以内，假设 extend 的价
+  是对的：0912 稳态里 decode 实际约占 1 − 0.36 = 0.64，模型给 0.42；尾巴里实际约 0.87，模型给 0.52。两处
+  都是 run 里每步 decode 比 grid 慢 1.5 到 1.65 倍。可用同样的 args 单独起 server，decode 每步只比 grid 多
+  0 到 5%（§8）。所以是 run 里有什么东西让 decode 变慢，cost model 在 standalone 上是对的。配置查过：
+  rollout 的 `enforce_eager` 是 false（config 里两处 true 在 reward 段），CUDA graph 开着。剩下的嫌疑都是
+  standalone 那次没有的：机器上几十个 container 和 eval 抢 CPU，B 小时一步 GPU 只有 5 ms，overlap 盖不住
+  scheduler 的 CPU；verl 开的 `enable_memory_saver`；prometheus middleware 和每个 batch 的 stats loop。
+  验法是在 standalone server 上把这几样一样一样加回去，看 decode 每步多出多少。要 GPU，不用跑训练。
+- **0912 的 attention backend 没法确定。** 写 0912 的 bundle 时发现：run 当时的 commit（b2f97c8）里
+  config 写的是 `attention_backend: flashinfer`，没写 `page_size`，这样 SGLang 的 page 是 1；可 run 的
+  `cached_tokens` 是按 64 取整的，所以 server 实际用的不是 commit 里那份。`trtllm_mha` 是 2026-09-15
+  （eca206f）才写进 config 的，grid 和 standalone server 都用它。要是 0912 的 decode 其实走的是 flashinfer
+  的 kernel，1.5 倍里就有一部分是 calibration 配错了 server，不是 run 里多了什么。要查：0912 有没有留下
+  server 的启动 log。030010 确定是 `trtllm_mha`，它的尾巴也差，但它的 MoE 又和 grid 不一样。
+- **030010 稳态多算的 6% 到 9% 不作数。** 它跑在另一种状态里：一个 replica 扛 2,048 个 session，prefix
+  cache 装不下，51% 的后续轮次被 evict（中位数丢 10k token），三个 step 重新 prefill 了约 10 亿 token
+  （0912 是 6,200 万），稳态时间八成在 extend 上。它的 MoE 又是 `flashinfer_trtllm`，grid 量的是 `triton`，
+  calibration 本来就对不上。它只能用来证明尾巴那一条。
+- **想直接从 run 里量出一次 extend 多贵，没量成。** 办法是看已经在排队、紧跟着上一次 forward 跑完的
+  extend 隔了多久。小 extend 隔 39 到 54 ms（价是 34 ms），中间可能夹了一次 decode；大的被 chunked
+  prefill 切开，前几块在别的 forward 里跑过了，间隔偏短。这要等 scheduler 的 decode 日志。
+
 **每一步的 latency 目前没有真值可对。** 存档的 trace 最细只到每个请求。SGLang 其实每隔
 `decode_log_interval` 步会打印 batch 组成和 throughput，但写在 Ray actor 的 log 里，run
 20260912-072938 的 Ray session 已经没了。把这几行 log 存进 timeline 目录几乎没成本，也是验证每步
@@ -643,9 +838,11 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 | adapter | `src/simulator/adapters/`：接口在 `base.py`；只有一个 adapter（`generic.py`），`shapes.py` 认 trace 的长相，`trace.py` 逐字段判断来路；`agentic_messages.py` 是自家 harness 的 profile；`priors.py` 读默认 prior 和 config bundle | trace 的格式；逐字段判断来路 | `simulator.ir`、`simulator.observed` |
 | IR | `src/simulator/ir.py` | 只有 workload | — |
 | realise | `src/simulator/realise.py` | IR，加一个 seed | `simulator.ir` |
+| token id | `src/simulator/tokens.py`：从 IR 的结构造 token id（§7） | 抽样过的 IR，加上 stub 吐出的 output id | `simulator.ir` |
 | observed | `src/simulator/observed.py` | 真实系统的结果，也就是答案 | `simulator.ir`（只借 id 类型） |
-| engine | `src/simulator/engine/`：现在只有 `sglang_stub.py`（stub 化的真 scheduler，§7）；虚拟时钟、router、资源池待建 | 抽样过的 IR + config | `simulator.ir`、SGLang |
-| 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`，`stub_driver.py` 是 5(a)/(b) 用的合成闭环负载；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
+| config bundle | `src/simulator/bundle.py`：读 bundle、查齐全、给请求填 cap（§5） | 系统配置 | `simulator.ir` |
+| engine | `src/simulator/engine/`：`sglang_stub.py`（stub 化的真 scheduler，§7）、`cost_model.py`（§8，含拟合）、`router.py`（照抄 verl）、`engine.py`（虚拟时钟、资源池）、`system.py`（从 bundle 建出 replica、pool、cost model）；group barrier、训练段待建 | 抽样过的 IR + config | `simulator.ir`、`simulator.bundle`、SGLang |
+| 开发专用 | `src/simulator/dev/`：`agentic_timeline.py` 读自家 timeline（也是 adapter，守 adapter 那一行的 import 规矩），`priors.py` 从自家 run 量 prior、写 `default_priors.json`，`stub_driver.py` 是 5(a)/(b) 用的合成闭环负载，`ir_driver.py` 是 5(c) 用的、把真 IR 喂进 stub 的闭环；脚本在 `scripts/simulator_dev/` | 自家 run，连同答案 | 全部 |
 | 对答案 | 待建，放进 `src/simulator/dev/` | 两边都知道 | 全部 |
 
 规矩：
@@ -743,8 +940,8 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 2. **测量 grid。** 在 standalone server 上测出 `eta`。顺带把 3.7x 的 gap 变成一张按
    `(batch, context)` 排的残差表。
 3. **第一级对答案。** 单独接受或否掉 cost model。
-4. **补 instrumentation。** `generate` 事件加上 replica id；确认 overlap 开没开；把 scheduler 的
-   decode batch log 存档。
+4. **补 instrumentation。** `generate` 事件加上 replica id（2026-10-04 加了）；确认 overlap 开没开；把
+   scheduler 的 decode batch log 存档（还没做）。
 5. **接上真 scheduler，再搭 engine**（§7），按这个顺序：
    - (a) 一个进程里能起几个 stub 化的 `Scheduler`，起不了就走多进程；
    - (b) 量一次完整模拟要多久，定下 N；
@@ -761,8 +958,19 @@ step 耗时中位数    44.5ms vs 43.3ms -> 2.7%
 
 **现在到哪了（2026-10-07）：** 第 1 步做完了。5(a)、5(b) 提到 grid 前面先做了，因为它们不碰 `eta`，
 又决定 engine 是单进程还是多进程：一个进程能起多个 stub 化的 `Scheduler`，互不干扰；一次完整模拟
-385 秒，N=64 并行约 6.5 分钟（§7「量过的」）。顺带发现 SGLang 不缓存输出（§3）。下一步是 5(c)
-从 IR 造 token id，和第 2 步的测量 grid。下面是第 1 步的经过。
+385 秒，N=64 并行约 6.5 分钟（§7「量过的」）。顺带发现 SGLang 不缓存输出（§3）。
+
+5(c) 也做完了：从 IR 造 token id，0912 step 1 的后续轮次 `cached_tokens` 和 run 99.63% 一样（§7）。
+第 2 步做完了：grid（TP=4、2、1）、按 kernel 行为改写的式子、拟合（§8）；TP=8 的 grid 2026-10-13 开始测。
+第 3 步，第一级对答案，2026-10-13 改正以后：0912 step 1 稳态只解释了 75% 到 79%，尾巴 69%；030010 有记下
+的 replica，尾巴照样差，所以不是 router 重放的问题（§12）。两处都指向 run 里的 decode 比 standalone 慢
+1.5 倍上下。第 4 步里 replica id 早就加了（2026-10-04），还差 decode 日志存档。下一步：在 standalone server
+上把 run 才有的东西（抢 CPU、`enable_memory_saver`、stats loop）一样一样加回去，找出 decode 慢在哪；
+然后 5(d) 的 engine。
+
+5(d) 先开工了（2026-10-13），因为 8 张卡凑不齐，而 engine 只用 CPU。按这个顺序：时钟、config bundle、每个
+worker 各自的 pool、group barrier 和训练段、输出和 subagent。前两样做完了（§5、§7）。decode 慢 1.5 倍的原因
+找到之前，engine 的时间对答案只能当测量看，不当验收。下面是第 1 步的经过。
 
 schema 加抽样那一步——`src/simulator/ir.py`、
 `src/simulator/realise.py`、`src/simulator/observed.py`、`tests/test_simulator_ir.py`。IR 现在能
@@ -838,7 +1046,7 @@ report 在 `step<N>/pooled-crossstep/` 和 `step<N>/keyed-crossstep/`：
 - 只剩对话那级（R4）也用上了表：step 1、2 的 2,048 个 eval 全部查到了自己 instance 的值，step 3 是
   1,976 个。eval 和总量三个 step 都盖住了。
 
-中间两级的混合 adapter 仍然不做。config bundle 只落地了 prior 这一项，其余几项和 engine 都还没有。
+中间两级的混合 adapter 仍然不做。config bundle 后来补齐了（§5）。
 
 2026-10-07 拿 HuggingFace 上的别人的 trace 试了这个通用 adapter，没有为它们改一行格式代码，都用默认的
 `load` 读进来，`check` 和 `realise` 都过：

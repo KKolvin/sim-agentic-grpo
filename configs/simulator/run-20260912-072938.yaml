@@ -1,0 +1,41 @@
+# Config bundle for run 20260912-072938 (SIMULATOR.md §5): the system its step 1 ran on.
+# Development only: the engine replays this run against its own timeline.
+
+recipe:
+  workers: 8                     # rollout.agent.num_workers (verl default)
+  pools:                         # slots per worker, by the pool names the workload uses
+    container: 33                # AGENTIC_MAX_LIVE_CONTAINERS, scripts/run_grpo.sh at b2f97c8
+    eval: 4                      # AGENTIC_MAX_EVAL_CONTAINERS
+  request_cap:                   # verl's agent loop (async_sglang_server.generate)
+    max_new_tokens: 61440        # rollout.response_length
+    max_sequence_tokens: 65536   # data.max_prompt_length 4096 + response_length
+
+server:
+  sglang_version: 0.5.8
+  replicas: 2                    # 8 GPUs / TP 4
+  args:
+    model_path: /data0/shared/Qwen3-30B-A3B-Instruct-2507
+    tp_size: 4
+    context_length: 65536        # rollout.max_model_len
+    max_total_tokens: 4560512    # what the run's servers reported; a standalone server with
+                                 # the same args gets 5,145,984 (the trainer shares the GPUs)
+    page_size: 64
+    chunked_prefill_size: 16384  # verl does not pass max_num_batched_tokens: SGLang's B200 default
+    max_prefill_tokens: 16384    # SGLang default
+    max_running_requests: 256    # rollout.max_num_seqs
+    schedule_policy: fcfs
+    schedule_conservativeness: 1.0
+    disable_overlap_schedule: false
+    disable_cuda_graph: false    # rollout.enforce_eager is false
+    # The committed config at b2f97c8 says attention_backend flashinfer and no page_size,
+    # which would give page_size 1; the run's cached_tokens are 64-token pages, so the
+    # servers ran something else. trtllm_mha is what the grid copied as the run's args.
+    attention_backend: trtllm_mha
+    moe_runner_backend: triton
+    kv_cache_dtype: auto
+  env:                           # not set by the run: SGLang 0.5.8's defaults
+    SGLANG_INIT_NEW_TOKEN_RATIO: 0.7
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR: 0.14
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS: 600
+
+calibration: ../../analysis/costgrid/b200-tp4/calibration.json

@@ -1,6 +1,48 @@
 # Example config bundle for the simulator (SIMULATOR.md §5).
-# Only the `priors` section exists so far; recipe, server args and hardware come later.
-#
+# The trace says what work there was; this file says what system runs it. Every
+# section except priors is required, and nothing in them has a default: SGLang
+# derives several server args from GPU memory, so a "usual value" would be made up.
+# The values below are our run 20260912-072938's.
+
+# recipe: how the harness drives the servers.
+recipe:
+  workers: 8                     # worker processes; each has its own pool slots
+  pools:                         # slots per worker, by the pool names the trace's workload uses
+    container: 33                # containers alive at once (one per episode)
+    eval: 4                      # grading containers running at once
+  request_cap:                   # cap for requests whose trace did not record max_new_tokens:
+    max_new_tokens: 61440        #   min(max_new_tokens, max_sequence_tokens - prompt,
+    max_sequence_tokens: 65536   #       context_length - 1 - prompt)
+
+# server: the SGLang servers, in SGLang's own names. Read them off a live server
+# (GET /get_server_info) or its startup log.
+server:
+  sglang_version: 0.5.8          # must be the version the simulator's stub runs
+  replicas: 2                    # independent servers, each with its own prefix cache
+  args:
+    model_path: /data0/shared/Qwen3-30B-A3B-Instruct-2507
+    tp_size: 4
+    context_length: 65536
+    max_total_tokens: 4560512    # KV slots the server ended up with, not what you asked for
+    page_size: 64
+    chunked_prefill_size: 16384
+    max_prefill_tokens: 16384
+    max_running_requests: 256
+    schedule_policy: fcfs
+    schedule_conservativeness: 1.0
+    disable_overlap_schedule: false
+    attention_backend: trtllm_mha  # these three must match the calibration's grid
+    moe_runner_backend: triton
+    kv_cache_dtype: auto
+  env:                           # SGLang's defaults unless the server set them
+    SGLANG_INIT_NEW_TOKEN_RATIO: 0.7
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR: 0.14
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS: 600
+
+# calibration: the cost model fitted on a grid measured for this TP on this GPU
+# (scripts/measure_cost_grid.py, then scripts/fit_cost_model.py). Relative to this file.
+calibration: ../../analysis/costgrid/b200-tp4/calibration.json
+
 # priors: how long the work your trace did not time takes, in seconds.
 # One line per knob, either
 #   knob: 2          the median is 2 s
@@ -9,7 +51,6 @@
 # run's distribution so its median lands there; the spread between calls stays ours.
 # `python scripts/priors_template.py` lists every knob with our value;
 # `python scripts/show_priors.py <this file>` shows what each knob ends up using.
-
 priors:
   eval_duration: 45            # our harness takes about 45 s to score a patch (ours: 21.7 s)
   tool_duration: [0.5, 2]      # not sure; somewhere between 0.5 and 2 s (ours: 0.22 s)
